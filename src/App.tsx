@@ -6,7 +6,10 @@
 import { useEffect, useState } from 'react';
 import type { MeResponse } from '../shared/schema.ts';
 import { Navbar } from './components/Navbar.tsx';
+import { BottomTabBar } from './components/BottomTabBar.tsx';
 import { SignInPage } from './pages/SignInPage.tsx';
+import { FeedPage } from './pages/FeedPage.tsx';
+import { PostComposerPage } from './pages/PostComposerPage.tsx';
 import { ProfileEditPage } from './pages/ProfileEditPage.tsx';
 import { ProfileViewPage } from './pages/ProfileViewPage.tsx';
 // DEV-ONLY: remove before launch
@@ -15,7 +18,8 @@ import { DevBar } from './components/DevBar.tsx';
 export default function App() {
   const [currentUser, setCurrentUser] = useState<MeResponse | null>(null);
   const [loadingUser, setLoadingUser] = useState(true);
-  const [activeTab, setActiveTab] = useState<'signin' | 'edit' | 'view'>('signin');
+  const [activeTab, setActiveTab] = useState<'feed' | 'post' | 'profile' | 'signin'>('feed');
+  const [profileSubView, setProfileSubView] = useState<'view' | 'edit'>('view');
   const [viewUsername, setViewUsername] = useState<string>('');
 
   const checkAuth = async () => {
@@ -24,7 +28,7 @@ export default function App() {
       if (res.ok) {
         const data = (await res.json()) as MeResponse;
         setCurrentUser(data);
-        setActiveTab('edit');
+        setActiveTab('feed');
       } else {
         setCurrentUser(null);
         setActiveTab('signin');
@@ -54,6 +58,8 @@ export default function App() {
 
   const handleProfileUpdated = (updated: MeResponse) => {
     setCurrentUser(updated);
+    setProfileSubView('view');
+    setViewUsername(updated.profile.username);
   };
 
   const handleAccountDeleted = () => {
@@ -61,9 +67,10 @@ export default function App() {
     setActiveTab('signin');
   };
 
-  const handleViewPublicProfile = (username: string) => {
+  const handleViewAuthorProfile = (username: string) => {
     setViewUsername(username);
-    setActiveTab('view');
+    setProfileSubView('view');
+    setActiveTab('profile');
   };
 
   if (loadingUser) {
@@ -78,13 +85,12 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-bg text-text flex flex-col font-sans pb-10">
+    <div className="min-h-screen bg-bg text-text flex flex-col font-sans pb-20">
       <Navbar
         currentUser={currentUser}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         onLogout={handleLogout}
-        viewUsername={viewUsername}
       />
 
       <main className="flex-1 w-full">
@@ -92,29 +98,61 @@ export default function App() {
           <SignInPage onSuccessRedirect={() => checkAuth()} />
         )}
 
-        {activeTab === 'edit' && currentUser && (
+        {activeTab === 'feed' && currentUser && (
+          <FeedPage
+            currentUserId={currentUser.user.id}
+            onNavigateToCompose={() => setActiveTab('post')}
+            onViewAuthorProfile={handleViewAuthorProfile}
+          />
+        )}
+
+        {activeTab === 'post' && currentUser && (
+          <PostComposerPage
+            onPostCreated={() => setActiveTab('feed')}
+          />
+        )}
+
+        {activeTab === 'profile' && currentUser && profileSubView === 'edit' && (
           <ProfileEditPage
             currentUser={currentUser}
             onProfileUpdated={handleProfileUpdated}
             onAccountDeleted={handleAccountDeleted}
-            onViewPublicProfile={handleViewPublicProfile}
+            onViewPublicProfile={(u) => {
+              setViewUsername(u);
+              setProfileSubView('view');
+            }}
           />
         )}
 
-        {activeTab === 'edit' && !currentUser && (
-          <SignInPage onSuccessRedirect={() => checkAuth()} />
-        )}
-
-        {activeTab === 'view' && (
+        {activeTab === 'profile' && currentUser && profileSubView === 'view' && (
           <ProfileViewPage
-            initialUsername={viewUsername || currentUser?.profile.username || ''}
+            initialUsername={viewUsername || currentUser.profile.username}
+            currentUserId={currentUser.user.id}
+            onNavigateToEditProfile={() => setProfileSubView('edit')}
           />
+        )}
+
+        {(!currentUser && activeTab !== 'signin') && (
+          <SignInPage onSuccessRedirect={() => checkAuth()} />
         )}
       </main>
 
-      <footer className="border-t border-border py-4 text-center text-[12px] text-text-muted">
-        Dialtone · Milestone 1 Foundation
+      <footer className="border-t border-border py-4 text-center text-[12px] text-text-muted hidden sm:block">
+        Dialtone · Ephemeral Social Network · Milestone 2
       </footer>
+
+      {/* Mobile-first bottom tab bar */}
+      <BottomTabBar
+        activeTab={activeTab}
+        setActiveTab={(tab) => {
+          if (tab === 'profile') {
+            setViewUsername(currentUser?.profile.username || '');
+            setProfileSubView('view');
+          }
+          setActiveTab(tab);
+        }}
+        isAuthenticated={!!currentUser}
+      />
 
       {/* DEV-ONLY: remove before launch */}
       <DevBar currentUser={currentUser} onLogout={handleLogout} />

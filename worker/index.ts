@@ -1,5 +1,5 @@
-import type { ExecutionContext, D1PreparedStatement } from '@cloudflare/workers-types';
-import type { Env, ProfileRow, UserRow, UserSettingsRow } from './types.ts';
+import type { ExecutionContext, D1PreparedStatement, ScheduledController } from '@cloudflare/workers-types';
+import type { Env, ProfileRow, UserRow, UserSettingsRow, PostRow, MediaRow } from './types.ts';
 import {
   authenticateRequest,
   decodeOAuthState,
@@ -11,7 +11,17 @@ import {
   verifyGoogleIdToken,
 } from './auth.ts';
 import { normalizeUsername } from '../shared/username.ts';
-import { updateProfileSchema } from '../shared/schema.ts';
+import {
+  updateProfileSchema,
+  createPostSchema,
+  createCommentSchema,
+  createReportSchema,
+  type PostItem,
+  type CommentItem,
+  type MediaItem,
+} from '../shared/schema.ts';
+import { checkRateLimit } from './rate-limit.ts';
+import { runPostLifecycleExpiry, deletePostAndMedia } from './jobs/expiry.ts';
 
 function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -35,6 +45,11 @@ function generateRandomUsername(): string {
 }
 
 export default {
+  // Cloudflare Scheduled Cron Trigger handler for daily post expiry job
+  async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await runPostLifecycleExpiry(env);
+  },
+
   async fetch(request: Request, env: Env, _ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const pathname = url.pathname;
@@ -52,6 +67,9 @@ export default {
     const cookieSameSite = isDevelopment && isHttps ? ('None' as const) : ('Lax' as const);
     const cookiePartitioned = isDevelopment && isHttps;
 
+    // CLEANUP #1: Revert oauth_state cookie to Path=/api/auth/callback outside development
+    const oauthCookiePath = isDevelopment ? '/' : '/api/auth/callback';
+
     // CORS / preflight
     if (method === 'OPTIONS') {
       return new Response(null, {
@@ -65,10 +83,13 @@ export default {
       });
     }
 
-    // 1. GET /api/auth/google - Initiate Google Sign-In with PKCE
+    // ==========================================
+    // 1. AUTHENTICATION ROUTES
+    // ==========================================
+
+    // GET /api/auth/google - Initiate Google Sign-In with PKCE
     if (pathname === '/api/auth/google' && method === 'GET') {
       // DEV-ONLY: remove before launch
-      // The mock login path (mock=true / PLACEHOLDER client ID) works ONLY when env.ENVIRONMENT === 'development'
       const isMockRequested =
         url.searchParams.get('mock') === 'true' || env.GOOGLE_CLIENT_ID === 'PLACEHOLDER';
 
@@ -102,8 +123,6 @@ export default {
       googleAuthUrl.searchParams.set('prompt', 'select_account');
 
       // DEV-ONLY: remove before launch
-      // When ENVIRONMENT === 'development', use a relative Location header so the oauth_state cookie
-      // is always sent regardless of differences between APP_URL and the browser's host (e.g. preview proxy).
       const targetUrl =
         isMockRequested && isDevelopment
           ? `/api/auth/callback?code=mock_code&state=${encodeURIComponent(state)}&mock=true`
@@ -114,8 +133,8 @@ export default {
         headers: {
           Location: targetUrl,
           'Set-Cookie': serializeCookie('oauth_state', oauthState, {
-            path: '/',
-            maxAge: 600, // 10 minutes
+            path: oauthCookiePath,
+            maxAge: 600,
             httpOnly: true,
             secure: cookieSecure,
             sameSite: cookieSameSite,
@@ -125,7 +144,7 @@ export default {
       });
     }
 
-    // 2. GET /api/auth/callback - Handle OAuth callback, verify state & nonce, set session cookie
+    // GET /api/auth/callback - Handle OAuth callback
     if (pathname === '/api/auth/callback' && method === 'GET') {
       const code = url.searchParams.get('code');
       const stateParam = url.searchParams.get('state');
@@ -148,8 +167,6 @@ export default {
       let oauthState = rawOAuthCookie ? decodeOAuthState(rawOAuthCookie) : null;
 
       // DEV-ONLY: remove before launch
-      // If the browser/iframe blocked the transient oauth_state cookie during development mock login,
-      // fallback to creating the mock state so developer workflow is never blocked in third-party iframes.
       if (!oauthState && isDevelopment && isMockCode) {
         oauthState = {
           state: stateParam || 'mock_state',
@@ -167,7 +184,6 @@ export default {
         return jsonResponse({ error: 'Invalid or expired OAuth state cookie' }, 400);
       }
 
-      // Strict state verification: bad state must be rejected with 400
       if (!stateParam || stateParam !== oauthState.state) {
         return jsonResponse({ error: 'Invalid OAuth state parameter' }, 400);
       }
@@ -183,7 +199,6 @@ export default {
       if (isMockCode) {
         providerSubject = `google_mock_sub_${oauthState.nonce.slice(0, 12)}`;
       } else {
-        // Exchange authorization code with PKCE verifier at Google token endpoint
         let tokenResponse: globalThis.Response;
         try {
           tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
@@ -213,7 +228,6 @@ export default {
           return jsonResponse({ error: 'Authentication failed' }, 400);
         }
 
-        // Verify ID token signature against Google JWKS and require email_verified
         try {
           const idTokenPayload = await verifyGoogleIdToken(
             tokenData.id_token,
@@ -236,7 +250,7 @@ export default {
       const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
       if (!existingUser) {
-        // New accounts get a random username (user_ + 6 random chars), never derived from email
+        // Usernames for new accounts are random (user_ + 6 random chars), never derived from email
         const userId = `usr_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
 
         let finalUsername = generateRandomUsername();
@@ -253,7 +267,7 @@ export default {
         const normalizedUsername = normalizeUsername(finalUsername);
         const displayName = finalUsername;
 
-        // Use D1 batch for signup: users, profiles, user_settings, session
+        // D1 batch for signup: users, profiles, user_settings, sessions
         try {
           await env.DB.batch([
             env.DB.prepare(
@@ -281,16 +295,13 @@ export default {
           return jsonResponse({ error: 'User account is inactive' }, 403);
         }
 
-        // Insert new session for existing user
         await env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
           .bind(sessionId, existingUser.id, expiresAt)
           .run();
       }
 
-      // Return redirect to frontend with session cookie and clear oauth_state
       const headers = new Headers();
       // DEV-ONLY: remove before launch
-      // Use relative Location header ("/") in development so the redirect stays on the request's host
       const postLoginLocation = isDevelopment ? '/' : `${env.APP_URL}/`;
       headers.set('Location', postLoginLocation);
       headers.append(
@@ -307,7 +318,7 @@ export default {
       headers.append(
         'Set-Cookie',
         serializeCookie('oauth_state', '', {
-          path: '/',
+          path: oauthCookiePath,
           maxAge: 0,
           httpOnly: true,
           secure: cookieSecure,
@@ -322,7 +333,7 @@ export default {
       });
     }
 
-    // 3. POST /api/auth/logout - Invalidate session and clear session cookie
+    // POST /api/auth/logout - Invalidate session
     if (pathname === '/api/auth/logout' && method === 'POST') {
       const cookies = parseCookies(request.headers.get('Cookie'));
       const sessionId = cookies['session_id'];
@@ -347,8 +358,12 @@ export default {
       );
     }
 
-    // 4. GET /api/users/:username - Public profile by username (REQUIRES A VALID SESSION)
-    if (pathname.startsWith('/api/users/') && method === 'GET') {
+    // ==========================================
+    // 2. USER PROFILE & SETTINGS ROUTES
+    // ==========================================
+
+    // GET /api/users/:username - Public profile by username (requires session)
+    if (pathname.startsWith('/api/users/') && !pathname.includes('/follow') && method === 'GET') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
         return jsonResponse({ error: 'Unauthorized' }, 401);
@@ -362,13 +377,14 @@ export default {
       const normalized = normalizeUsername(usernameParam);
 
       const row = await env.DB.prepare(
-        `SELECT p.username, p.display_name, p.bio, p.avatar_media_id, u.created_at
+        `SELECT p.user_id, p.username, p.display_name, p.bio, p.avatar_media_id, u.created_at
          FROM profiles p
          JOIN users u ON u.id = p.user_id
          WHERE p.username_normalized = ? AND u.status = 'active'`
       )
         .bind(normalized)
         .first<{
+          user_id: string;
           username: string;
           display_name: string;
           bio: string;
@@ -380,17 +396,38 @@ export default {
         return jsonResponse({ error: 'User not found' }, 404);
       }
 
-      // Return public fields only
+      // Check if current user follows this user
+      const isFollowing = await env.DB.prepare(
+        'SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?'
+      )
+        .bind(auth.user.id, row.user_id)
+        .first();
+
+      const followersCount = await env.DB.prepare(
+        'SELECT COUNT(*) as count FROM follows WHERE followed_id = ?'
+      )
+        .bind(row.user_id)
+        .first<{ count: number }>();
+
+      const followingCount = await env.DB.prepare(
+        'SELECT COUNT(*) as count FROM follows WHERE follower_id = ?'
+      )
+        .bind(row.user_id)
+        .first<{ count: number }>();
+
       return jsonResponse({
         username: row.username,
         display_name: row.display_name,
         bio: row.bio,
         avatar_media_id: row.avatar_media_id,
         created_at: row.created_at,
+        is_following: !!isFollowing,
+        followers_count: Number(followersCount?.count || 0),
+        following_count: Number(followingCount?.count || 0),
       });
     }
 
-    // 5. GET /api/me - Retrieve current authenticated user profile
+    // GET /api/me - Retrieve current authenticated profile
     if (pathname === '/api/me' && method === 'GET') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
@@ -417,7 +454,7 @@ export default {
       });
     }
 
-    // 6. PATCH /api/me - Update profile fields (validated with shared schema, using D1 batch)
+    // PATCH /api/me - Update profile fields (validated with shared schema, using D1 batch)
     if (pathname === '/api/me' && method === 'PATCH') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
@@ -458,10 +495,8 @@ export default {
         }
       }
 
-      // Build batch statements for multi-field updates
       const batchStatements: D1PreparedStatement[] = [];
 
-      // Update profiles fields
       if (
         data.username !== undefined ||
         data.display_name !== undefined ||
@@ -486,7 +521,6 @@ export default {
         );
       }
 
-      // Update user_settings fields
       if (data.dm_policy !== undefined || data.feed_preferences !== undefined) {
         const currentSettings = auth.settings;
         const newDmPolicy =
@@ -507,7 +541,6 @@ export default {
         );
       }
 
-      // Execute multi-field update using D1 batch
       if (batchStatements.length > 0) {
         try {
           await env.DB.batch(batchStatements);
@@ -520,7 +553,6 @@ export default {
         }
       }
 
-      // Return updated profile
       const updatedProfile = await env.DB.prepare('SELECT * FROM profiles WHERE user_id = ?')
         .bind(auth.user.id)
         .first<ProfileRow>();
@@ -540,7 +572,7 @@ export default {
       });
     }
 
-    // 7. DELETE /api/me - Account deletion: remove user and their rows using D1 batch
+    // DELETE /api/me - Account deletion in D1 batch
     if (pathname === '/api/me' && method === 'DELETE') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
@@ -549,7 +581,21 @@ export default {
 
       const userId = auth.user.id;
 
-      // Use D1 batch for atomic account deletion across all tables
+      // Find all media owned by user to clean up from R2
+      const userMedia = await env.DB.prepare('SELECT object_key FROM media WHERE owner_id = ?')
+        .bind(userId)
+        .all<{ object_key: string }>();
+
+      if (env.MEDIA_BUCKET && userMedia.results) {
+        for (const m of userMedia.results) {
+          try {
+            await env.MEDIA_BUCKET.delete(m.object_key);
+          } catch {
+            // Ignore R2 deletion error during account purge
+          }
+        }
+      }
+
       await env.DB.batch([
         env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
         env.DB.prepare('DELETE FROM user_settings WHERE user_id = ?').bind(userId),
@@ -557,7 +603,6 @@ export default {
         env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId),
       ]);
 
-      // Clear session cookie
       return jsonResponse(
         { success: true, message: 'Account and associated data deleted permanently' },
         200,
@@ -574,12 +619,789 @@ export default {
       );
     }
 
-    // Explicitly reject any starter routes that were deleted or not allowed
-    if (pathname === '/api/users' || pathname.startsWith('/api/files')) {
-      return jsonResponse({ error: 'Not found' }, 404);
+    // ==========================================
+    // 3. SOCIAL POSTS, FEED & INTERACTIONS
+    // ==========================================
+
+    // POST /api/posts - Create new post (body max 1000 chars, up to 4 images, 7-day expiry)
+    if (pathname === '/api/posts' && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      // Rate limit: max 10 posts per hour per user
+      const rate = checkRateLimit(`post:${auth.user.id}`, 10, 60 * 60 * 1000);
+      if (!rate.allowed) {
+        return jsonResponse(
+          { error: 'Rate limit exceeded: maximum 10 posts per hour. Please try again later.' },
+          429,
+          { 'Retry-After': String(rate.retryAfterSeconds) }
+        );
+      }
+
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const parseResult = createPostSchema.safeParse(body);
+      if (!parseResult.success) {
+        return jsonResponse(
+          { error: 'Validation failed', issues: parseResult.error.issues },
+          400
+        );
+      }
+
+      const { body: postBody, media_ids = [] } = parseResult.data;
+
+      // Validate media_ids: max 4, owned by author, exist
+      if (media_ids.length > 0) {
+        for (const mId of media_ids) {
+          const mediaRow = await env.DB.prepare(
+            'SELECT id, owner_id FROM media WHERE id = ?'
+          )
+            .bind(mId)
+            .first<{ id: string; owner_id: string }>();
+
+          if (!mediaRow) {
+            return jsonResponse({ error: `Media ${mId} not found` }, 400);
+          }
+          if (mediaRow.owner_id !== auth.user.id) {
+            return jsonResponse({ error: `You do not own media ${mId}` }, 403);
+          }
+        }
+      }
+
+      const nowMs = Date.now();
+      const createdAt = new Date(nowMs).toISOString();
+      // New posts get expires_at = created_at + 7 days
+      const expiresAt = new Date(nowMs + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const postId = `pst_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+
+      const statements: D1PreparedStatement[] = [
+        env.DB.prepare(
+          'INSERT INTO posts (id, author_id, body, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?)'
+        ).bind(postId, auth.user.id, postBody, createdAt, expiresAt, 'active'),
+      ];
+
+      for (const mId of media_ids) {
+        statements.push(
+          env.DB.prepare(
+            'INSERT INTO post_media (post_id, media_id) VALUES (?, ?)'
+          ).bind(postId, mId)
+        );
+      }
+
+      await env.DB.batch(statements);
+
+      return jsonResponse(
+        {
+          id: postId,
+          author_id: auth.user.id,
+          body: postBody,
+          created_at: createdAt,
+          expires_at: expiresAt,
+          status: 'active',
+          media_ids,
+        },
+        201
+      );
     }
 
-    // Return 404 for any other unrecognized /api/* route
+    // GET /api/posts/:id - Retrieve single post with media, likes count, and user like status
+    if (pathname.startsWith('/api/posts/') && !pathname.includes('/likes') && !pathname.includes('/comments') && method === 'GET') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const postId = pathname.slice('/api/posts/'.length);
+      const post = await env.DB.prepare(
+        `SELECT p.id, p.author_id, p.body, p.created_at, p.expires_at, p.status,
+                pr.username AS author_username, pr.display_name AS author_display_name, pr.avatar_media_id AS author_avatar_media_id
+         FROM posts p
+         JOIN profiles pr ON pr.user_id = p.author_id
+         WHERE p.id = ? AND p.status = 'active'`
+      )
+        .bind(postId)
+        .first<PostRow & { author_username: string; author_display_name: string; author_avatar_media_id: string | null }>();
+
+      if (!post) {
+        return jsonResponse({ error: 'Post not found' }, 404);
+      }
+
+      // Fetch linked media
+      const media = await env.DB.prepare(
+        `SELECT m.id, m.object_key, m.mime_type, m.size_bytes
+         FROM media m
+         JOIN post_media pm ON pm.media_id = m.id
+         WHERE pm.post_id = ?`
+      )
+        .bind(postId)
+        .all<MediaItem>();
+
+      // Likes count and user like status
+      const likesCount = await env.DB.prepare(
+        'SELECT COUNT(*) as count FROM post_reactions WHERE post_id = ?'
+      )
+        .bind(postId)
+        .first<{ count: number }>();
+
+      const hasLiked = await env.DB.prepare(
+        'SELECT 1 FROM post_reactions WHERE post_id = ? AND user_id = ?'
+      )
+        .bind(postId, auth.user.id)
+        .first();
+
+      const commentsCount = await env.DB.prepare(
+        'SELECT COUNT(*) as count FROM comments WHERE post_id = ?'
+      )
+        .bind(postId)
+        .first<{ count: number }>();
+
+      const postItem: PostItem = {
+        id: post.id,
+        author_id: post.author_id,
+        author_username: post.author_username,
+        author_display_name: post.author_display_name,
+        author_avatar_media_id: post.author_avatar_media_id,
+        body: post.body,
+        created_at: post.created_at,
+        expires_at: post.expires_at,
+        status: post.status,
+        media: media.results || [],
+        likes_count: Number(likesCount?.count || 0),
+        has_liked: !!hasLiked,
+        comments_count: Number(commentsCount?.count || 0),
+      };
+
+      return jsonResponse(postItem);
+    }
+
+    // DELETE /api/posts/:id - Author only delete
+    if (pathname.startsWith('/api/posts/') && !pathname.includes('/likes') && !pathname.includes('/comments') && method === 'DELETE') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const postId = pathname.slice('/api/posts/'.length);
+      const post = await env.DB.prepare('SELECT author_id FROM posts WHERE id = ?')
+        .bind(postId)
+        .first<{ author_id: string }>();
+
+      if (!post) {
+        return jsonResponse({ error: 'Post not found' }, 404);
+      }
+
+      // Check author ownership
+      if (post.author_id !== auth.user.id) {
+        return jsonResponse({ error: 'Forbidden: You can only delete your own posts' }, 403);
+      }
+
+      await deletePostAndMedia(env, postId);
+
+      return jsonResponse({ success: true, message: 'Post deleted successfully' });
+    }
+
+    // GET /api/feed - Chronological feed from followed users plus own posts with cursor pagination
+    if (pathname === '/api/feed' && method === 'GET') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const cursor = url.searchParams.get('cursor'); // ISO date string of last post's created_at
+      const limit = Math.min(Math.max(1, Number(url.searchParams.get('limit') || 20)), 50);
+
+      let query = `
+        SELECT p.id, p.author_id, p.body, p.created_at, p.expires_at, p.status,
+               pr.username AS author_username, pr.display_name AS author_display_name, pr.avatar_media_id AS author_avatar_media_id
+        FROM posts p
+        JOIN profiles pr ON pr.user_id = p.author_id
+        WHERE p.status = 'active'
+          AND p.expires_at > datetime('now')
+          AND (p.author_id = ? OR p.author_id IN (SELECT followed_id FROM follows WHERE follower_id = ?))
+      `;
+
+      const params: unknown[] = [auth.user.id, auth.user.id];
+
+      if (cursor) {
+        query += ' AND p.created_at < ?';
+        params.push(cursor);
+      }
+
+      query += ' ORDER BY p.created_at DESC LIMIT ?';
+      params.push(limit + 1);
+
+      const rowsResult = await env.DB.prepare(query)
+        .bind(...params)
+        .all<PostRow & { author_username: string; author_display_name: string; author_avatar_media_id: string | null }>();
+
+      const rows = rowsResult.results || [];
+      const hasMore = rows.length > limit;
+      const itemsToReturn = hasMore ? rows.slice(0, limit) : rows;
+
+      // Populate media, likes, and comments for returned items
+      const posts: PostItem[] = [];
+      for (const p of itemsToReturn) {
+        const media = await env.DB.prepare(
+          `SELECT m.id, m.object_key, m.mime_type, m.size_bytes
+           FROM media m
+           JOIN post_media pm ON pm.media_id = m.id
+           WHERE pm.post_id = ?`
+        )
+          .bind(p.id)
+          .all<MediaItem>();
+
+        const likesCount = await env.DB.prepare(
+          'SELECT COUNT(*) as count FROM post_reactions WHERE post_id = ?'
+        )
+          .bind(p.id)
+          .first<{ count: number }>();
+
+        const hasLiked = await env.DB.prepare(
+          'SELECT 1 FROM post_reactions WHERE post_id = ? AND user_id = ?'
+        )
+          .bind(p.id, auth.user.id)
+          .first();
+
+        const commentsCount = await env.DB.prepare(
+          'SELECT COUNT(*) as count FROM comments WHERE post_id = ?'
+        )
+          .bind(p.id)
+          .first<{ count: number }>();
+
+        posts.push({
+          id: p.id,
+          author_id: p.author_id,
+          author_username: p.author_username,
+          author_display_name: p.author_display_name,
+          author_avatar_media_id: p.author_avatar_media_id,
+          body: p.body,
+          created_at: p.created_at,
+          expires_at: p.expires_at,
+          status: p.status,
+          media: media.results || [],
+          likes_count: Number(likesCount?.count || 0),
+          has_liked: !!hasLiked,
+          comments_count: Number(commentsCount?.count || 0),
+        });
+      }
+
+      const nextCursor =
+        hasMore && posts.length > 0 ? posts[posts.length - 1]!.created_at : null;
+
+      return jsonResponse({
+        posts,
+        next_cursor: nextCursor,
+        has_more: hasMore,
+      });
+    }
+
+    // POST /api/posts/:id/likes - Like a post
+    if (pathname.match(/^\/api\/posts\/[^/]+\/likes$/) && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const postId = pathname.split('/')[3]!;
+      const post = await env.DB.prepare("SELECT id FROM posts WHERE id = ? AND status = 'active'")
+        .bind(postId)
+        .first();
+
+      if (!post) {
+        return jsonResponse({ error: 'Post not found' }, 404);
+      }
+
+      const now = new Date().toISOString();
+      try {
+        await env.DB.prepare(
+          'INSERT OR IGNORE INTO post_reactions (post_id, user_id, type, created_at) VALUES (?, ?, ?, ?)'
+        )
+          .bind(postId, auth.user.id, 'like', now)
+          .run();
+      } catch {
+        // Ignored if reaction already exists
+      }
+
+      const likesCount = await env.DB.prepare(
+        'SELECT COUNT(*) as count FROM post_reactions WHERE post_id = ?'
+      )
+        .bind(postId)
+        .first<{ count: number }>();
+
+      return jsonResponse({
+        success: true,
+        has_liked: true,
+        likes_count: Number(likesCount?.count || 0),
+      });
+    }
+
+    // DELETE /api/posts/:id/likes - Unlike a post
+    if (pathname.match(/^\/api\/posts\/[^/]+\/likes$/) && method === 'DELETE') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const postId = pathname.split('/')[3]!;
+
+      await env.DB.prepare(
+        'DELETE FROM post_reactions WHERE post_id = ? AND user_id = ? AND type = "like"'
+      )
+        .bind(postId, auth.user.id)
+        .run();
+
+      const likesCount = await env.DB.prepare(
+        'SELECT COUNT(*) as count FROM post_reactions WHERE post_id = ?'
+      )
+        .bind(postId)
+        .first<{ count: number }>();
+
+      return jsonResponse({
+        success: true,
+        has_liked: false,
+        likes_count: Number(likesCount?.count || 0),
+      });
+    }
+
+    // GET /api/posts/:id/comments - Retrieve comments on a post
+    if (pathname.match(/^\/api\/posts\/[^/]+\/comments$/) && method === 'GET') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const postId = pathname.split('/')[3]!;
+      const cursor = url.searchParams.get('cursor');
+      const limit = Math.min(Math.max(1, Number(url.searchParams.get('limit') || 20)), 50);
+
+      let query = `
+        SELECT c.id, c.post_id, c.author_id, c.body, c.created_at,
+               pr.username AS author_username, pr.display_name AS author_display_name
+        FROM comments c
+        JOIN profiles pr ON pr.user_id = c.author_id
+        WHERE c.post_id = ?
+      `;
+      const params: unknown[] = [postId];
+
+      if (cursor) {
+        query += ' AND c.created_at > ?';
+        params.push(cursor);
+      }
+
+      query += ' ORDER BY c.created_at ASC LIMIT ?';
+      params.push(limit + 1);
+
+      const rowsResult = await env.DB.prepare(query)
+        .bind(...params)
+        .all<CommentItem>();
+
+      const rows = rowsResult.results || [];
+      const hasMore = rows.length > limit;
+      const comments = hasMore ? rows.slice(0, limit) : rows;
+      const nextCursor =
+        hasMore && comments.length > 0 ? comments[comments.length - 1]!.created_at : null;
+
+      return jsonResponse({
+        comments,
+        next_cursor: nextCursor,
+        has_more: hasMore,
+      });
+    }
+
+    // POST /api/posts/:id/comments - Add comment to post
+    if (pathname.match(/^\/api\/posts\/[^/]+\/comments$/) && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      // Rate limit: max 30 comments per hour per user
+      const rate = checkRateLimit(`comment:${auth.user.id}`, 30, 60 * 60 * 1000);
+      if (!rate.allowed) {
+        return jsonResponse(
+          { error: 'Rate limit exceeded: maximum 30 comments per hour. Please try again later.' },
+          429,
+          { 'Retry-After': String(rate.retryAfterSeconds) }
+        );
+      }
+
+      const postId = pathname.split('/')[3]!;
+      const post = await env.DB.prepare("SELECT id, expires_at FROM posts WHERE id = ? AND status = 'active'")
+        .bind(postId)
+        .first<{ id: string; expires_at: string }>();
+
+      if (!post) {
+        return jsonResponse({ error: 'Post not found' }, 404);
+      }
+
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const parseResult = createCommentSchema.safeParse(body);
+      if (!parseResult.success) {
+        return jsonResponse(
+          { error: 'Validation failed', issues: parseResult.error.issues },
+          400
+        );
+      }
+
+      const commentId = `cmt_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+      const now = new Date().toISOString();
+
+      await env.DB.prepare(
+        'INSERT INTO comments (id, post_id, author_id, body, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)'
+      )
+        .bind(commentId, postId, auth.user.id, parseResult.data.body, now, post.expires_at)
+        .run();
+
+      return jsonResponse(
+        {
+          id: commentId,
+          post_id: postId,
+          author_id: auth.user.id,
+          author_username: auth.profile.username,
+          author_display_name: auth.profile.display_name,
+          body: parseResult.data.body,
+          created_at: now,
+        },
+        201
+      );
+    }
+
+    // DELETE /api/comments/:id - Author only delete comment
+    if (pathname.startsWith('/api/comments/') && method === 'DELETE') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const commentId = pathname.slice('/api/comments/'.length);
+      const comment = await env.DB.prepare('SELECT author_id FROM comments WHERE id = ?')
+        .bind(commentId)
+        .first<{ author_id: string }>();
+
+      if (!comment) {
+        return jsonResponse({ error: 'Comment not found' }, 404);
+      }
+
+      if (comment.author_id !== auth.user.id) {
+        return jsonResponse({ error: 'Forbidden: You can only delete your own comments' }, 403);
+      }
+
+      await env.DB.prepare('DELETE FROM comments WHERE id = ?').bind(commentId).run();
+
+      return jsonResponse({ success: true, message: 'Comment deleted successfully' });
+    }
+
+    // ==========================================
+    // 4. SOCIAL FOLLOWS & REPORTS
+    // ==========================================
+
+    // POST /api/users/:id/follow - Follow user
+    if (pathname.match(/^\/api\/users\/[^/]+\/follow$/) && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const param = pathname.split('/')[3]!;
+
+      // Find target user by id or username
+      const target = await env.DB.prepare(
+        'SELECT id FROM users WHERE id = ? OR id IN (SELECT user_id FROM profiles WHERE username_normalized = ?)'
+      )
+        .bind(param, normalizeUsername(param))
+        .first<{ id: string }>();
+
+      if (!target) {
+        return jsonResponse({ error: 'User not found' }, 404);
+      }
+
+      // Reject self-follow
+      if (target.id === auth.user.id) {
+        return jsonResponse({ error: 'Cannot follow yourself' }, 400);
+      }
+
+      const now = new Date().toISOString();
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO follows (follower_id, followed_id, created_at) VALUES (?, ?, ?)'
+      )
+        .bind(auth.user.id, target.id, now)
+        .run();
+
+      return jsonResponse({ success: true, is_following: true });
+    }
+
+    // DELETE /api/users/:id/follow - Unfollow user
+    if (pathname.match(/^\/api\/users\/[^/]+\/follow$/) && method === 'DELETE') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const param = pathname.split('/')[3]!;
+
+      const target = await env.DB.prepare(
+        'SELECT id FROM users WHERE id = ? OR id IN (SELECT user_id FROM profiles WHERE username_normalized = ?)'
+      )
+        .bind(param, normalizeUsername(param))
+        .first<{ id: string }>();
+
+      if (target) {
+        await env.DB.prepare(
+          'DELETE FROM follows WHERE follower_id = ? AND followed_id = ?'
+        )
+          .bind(auth.user.id, target.id)
+          .run();
+      }
+
+      return jsonResponse({ success: true, is_following: false });
+    }
+
+    // POST /api/reports - File a moderation report
+    if (pathname === '/api/reports' && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const parseResult = createReportSchema.safeParse(body);
+      if (!parseResult.success) {
+        return jsonResponse(
+          { error: 'Validation failed', issues: parseResult.error.issues },
+          400
+        );
+      }
+
+      const { target_type, target_id, reason } = parseResult.data;
+      const reportId = `rep_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+      const now = new Date().toISOString();
+
+      await env.DB.prepare(
+        'INSERT INTO reports (id, reporter_id, target_type, target_id, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      )
+        .bind(reportId, auth.user.id, target_type, target_id, reason, 'pending', now)
+        .run();
+
+      return jsonResponse(
+        { success: true, message: 'Report submitted successfully', id: reportId },
+        201
+      );
+    }
+
+    // ==========================================
+    // 5. MEDIA STORAGE (R2) & AUTHORIZED SERVING
+    // ==========================================
+
+    // POST /api/media/uploads - Upload media (max 5 MB, jpeg/png/webp only)
+    if (pathname === '/api/media/uploads' && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      // Rate limit: max 20 uploads per hour per user
+      const rate = checkRateLimit(`upload:${auth.user.id}`, 20, 60 * 60 * 1000);
+      if (!rate.allowed) {
+        return jsonResponse(
+          { error: 'Rate limit exceeded: maximum 20 uploads per hour. Please try again later.' },
+          429,
+          { 'Retry-After': String(rate.retryAfterSeconds) }
+        );
+      }
+
+      const contentType = request.headers.get('Content-Type') || '';
+      let fileBytes: Uint8Array;
+      let mimeType = '';
+
+      if (contentType.includes('multipart/form-data')) {
+        let formData: FormData;
+        try {
+          formData = await request.formData();
+        } catch {
+          return jsonResponse({ error: 'Invalid form data' }, 400);
+        }
+
+        const file = formData.get('file');
+        if (!file || typeof file === 'string') {
+          return jsonResponse({ error: 'Missing file field in form data' }, 400);
+        }
+
+        mimeType = (file as File).type;
+        const ab = await (file as File).arrayBuffer();
+        fileBytes = new Uint8Array(ab);
+      } else {
+        // Direct binary upload with Content-Type header
+        mimeType = contentType.split(';')[0]!.trim();
+        const ab = await request.arrayBuffer();
+        fileBytes = new Uint8Array(ab);
+      }
+
+      // Validate MIME type (jpeg/png/webp)
+      const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+      if (!allowedTypes.includes(mimeType)) {
+        return jsonResponse(
+          { error: `Invalid image type: "${mimeType}". Only JPEG, PNG, and WebP are supported.` },
+          400
+        );
+      }
+
+      // Validate file size (max 5 MB)
+      const maxSizeBytes = 5 * 1024 * 1024;
+      if (fileBytes.length === 0) {
+        return jsonResponse({ error: 'File is empty' }, 400);
+      }
+      if (fileBytes.length > maxSizeBytes) {
+        return jsonResponse(
+          { error: `File exceeds maximum size of 5 MB (actual: ${(fileBytes.length / (1024 * 1024)).toFixed(2)} MB)` },
+          400
+        );
+      }
+
+      // Generate random object key
+      const mediaId = `med_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+      const objectKey = `media_${generateRandomString(24).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+
+      // Store in R2
+      if (env.MEDIA_BUCKET) {
+        await env.MEDIA_BUCKET.put(objectKey, fileBytes, {
+          httpMetadata: { contentType: mimeType },
+        });
+      }
+
+      const nowMs = Date.now();
+      const createdAt = new Date(nowMs).toISOString();
+      const expiresAt = new Date(nowMs + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+      await env.DB.prepare(
+        'INSERT INTO media (id, owner_id, object_key, mime_type, size_bytes, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      )
+        .bind(mediaId, auth.user.id, objectKey, mimeType, fileBytes.length, createdAt, expiresAt)
+        .run();
+
+      return jsonResponse(
+        {
+          id: mediaId,
+          object_key: objectKey,
+          mime_type: mimeType,
+          size_bytes: fileBytes.length,
+          created_at: createdAt,
+        },
+        201
+      );
+    }
+
+    // GET /api/media/:id - Authorized Worker route serving R2 stream
+    if (pathname.startsWith('/api/media/') && method === 'GET') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const mediaId = pathname.slice('/api/media/'.length);
+      const media = await env.DB.prepare(
+        'SELECT id, object_key, mime_type FROM media WHERE id = ?'
+      )
+        .bind(mediaId)
+        .first<MediaRow>();
+
+      if (!media) {
+        return jsonResponse({ error: 'Media not found' }, 404);
+      }
+
+      if (!env.MEDIA_BUCKET) {
+        return jsonResponse({ error: 'Storage unavailable' }, 503);
+      }
+
+      const r2Object = await env.MEDIA_BUCKET.get(media.object_key);
+      if (!r2Object) {
+        return jsonResponse({ error: 'Media file missing from storage' }, 404);
+      }
+
+      return new Response(r2Object.body as any, {
+        headers: {
+          'Content-Type': media.mime_type,
+          'Cache-Control': 'private, max-age=86400',
+        },
+      });
+    }
+
+    // DELETE /api/media/:id - Delete media (owner only)
+    if (pathname.startsWith('/api/media/') && method === 'DELETE') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const mediaId = pathname.slice('/api/media/'.length);
+      const media = await env.DB.prepare(
+        'SELECT id, owner_id, object_key FROM media WHERE id = ?'
+      )
+        .bind(mediaId)
+        .first<MediaRow>();
+
+      if (!media) {
+        return jsonResponse({ error: 'Media not found' }, 404);
+      }
+
+      if (media.owner_id !== auth.user.id) {
+        return jsonResponse({ error: 'Forbidden: You can only delete your own media' }, 403);
+      }
+
+      if (env.MEDIA_BUCKET) {
+        try {
+          await env.MEDIA_BUCKET.delete(media.object_key);
+        } catch {
+          // Ignore R2 deletion error
+        }
+      }
+
+      await env.DB.prepare('DELETE FROM media WHERE id = ?').bind(mediaId).run();
+
+      return jsonResponse({ success: true, message: 'Media deleted successfully' });
+    }
+
+    // ==========================================
+    // 6. JOBS & LIFECYCLE
+    // ==========================================
+
+    // POST /api/jobs/cleanup-expired - Trigger post lifecycle expiry job
+    if (pathname === '/api/jobs/cleanup-expired' && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      // Optional reference_time query param for testing time travel
+      const refTimeParam = url.searchParams.get('reference_time');
+      const refTime = refTimeParam ? Number(refTimeParam) : Date.now();
+
+      const result = await runPostLifecycleExpiry(env, refTime);
+      return jsonResponse(result);
+    }
+
+    // ==========================================
+    // 7. 404 CATCH-ALL
+    // ==========================================
+
     if (pathname.startsWith('/api/')) {
       return jsonResponse({ error: 'Endpoint not found' }, 404);
     }

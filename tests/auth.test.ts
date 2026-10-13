@@ -57,6 +57,7 @@ describe('Google OAuth & Session Authentication', () => {
     expect(setCookie).toBeDefined();
     expect(setCookie).toContain('oauth_state=');
     expect(setCookie).toContain('Secure');
+    expect(setCookie).toContain('Path=/api/auth/callback');
   });
 
   // DEV-ONLY: remove before launch

@@ -13,6 +13,10 @@ database_id = "placeholder-d1-id"
 binding = "MEDIA_BUCKET"
 bucket_name = "dialtone-media"
 
+# Daily post expiry lifecycle cron trigger
+[triggers]
+crons = ["0 0 * * *"]
+
 # Non-secret environment variables
 [vars]
 ENVIRONMENT = "production"

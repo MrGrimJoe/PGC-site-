@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import worker from './worker/index.ts';
 import { createSqliteD1 } from './worker/db/sqlite-d1.ts';
 import { runMigrations } from './worker/db/migrate.ts';
+import { createMemoryR2Bucket } from './worker/db/r2-shim.ts';
 import type { Env } from './worker/types.ts';
 
 dotenv.config();
@@ -35,6 +36,7 @@ async function startServer() {
   // Initialize SQLite-backed D1 database for local development
   const dbPath = path.resolve(__dirname, '.local-dev-d1.sqlite');
   const d1 = createSqliteD1(dbPath);
+  const mediaBucket = createMemoryR2Bucket();
 
   // Run migrations on startup
   console.log('[D1] Applying migrations...');
@@ -47,6 +49,7 @@ async function startServer() {
 
   const env: Env = {
     DB: d1,
+    MEDIA_BUCKET: mediaBucket,
     APP_URL: process.env.APP_URL || `http://localhost:${PORT}`,
     // DEV-ONLY: remove before launch
     // Env vars may default to placeholder values ONLY in development

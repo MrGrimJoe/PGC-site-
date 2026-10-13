@@ -1,16 +1,23 @@
 import React, { useState, useEffect } from 'react';
 import type { PublicProfileResponse } from '../../shared/schema.ts';
-import { Search, User, Calendar, AlertCircle } from 'lucide-react';
+import { Search, User, Calendar, AlertCircle, UserPlus, UserCheck } from 'lucide-react';
 
 interface ProfileViewPageProps {
   initialUsername?: string;
+  currentUserId?: string;
+  onNavigateToEditProfile?: () => void;
 }
 
-export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({ initialUsername = '' }) => {
+export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({
+  initialUsername = '',
+  currentUserId,
+  onNavigateToEditProfile,
+}) => {
   const [searchUsername, setSearchUsername] = useState(initialUsername || '');
   const [profile, setProfile] = useState<PublicProfileResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [togglingFollow, setTogglingFollow] = useState(false);
 
   const fetchProfile = async (u: string) => {
     if (!u.trim()) return;
@@ -49,13 +56,45 @@ export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({ initialUsernam
     fetchProfile(searchUsername);
   };
 
+  const handleToggleFollow = async () => {
+    if (!profile || !profile.id) return;
+    setTogglingFollow(true);
+
+    const isCurrentlyFollowing = !!profile.is_following;
+    const method = isCurrentlyFollowing ? 'DELETE' : 'POST';
+
+    try {
+      const res = await fetch(`/api/users/${profile.id}/follow`, { method });
+      if (res.ok) {
+        setProfile((prev) =>
+          prev
+            ? {
+                ...prev,
+                is_following: !isCurrentlyFollowing,
+                followers_count: Math.max(
+                  0,
+                  (prev.followers_count || 0) + (isCurrentlyFollowing ? -1 : 1)
+                ),
+              }
+            : null
+        );
+      }
+    } catch {
+      // Ignore network error on follow toggle
+    } finally {
+      setTogglingFollow(false);
+    }
+  };
+
+  const isSelf = profile?.id === currentUserId;
+
   return (
     <div className="w-full max-w-[640px] mx-auto py-8 px-4 space-y-4">
       {/* Title */}
       <div>
         <h1 className="text-[24px] font-semibold text-text tracking-tight">User Directory</h1>
         <p className="text-[14px] text-text-muted mt-0.5">
-          Look up public profiles across the network
+          Look up public profiles and manage following connections
         </p>
       </div>
 
@@ -100,23 +139,71 @@ export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({ initialUsernam
       {/* Profile Card */}
       {profile && (
         <div className="bg-surface border border-border rounded-card p-4 shadow-card space-y-4">
-          <div className="flex items-start space-x-3">
-            <div className="w-12 h-12 rounded-sm bg-primary text-on-primary flex items-center justify-center font-semibold text-[20px] shrink-0">
-              {profile.display_name.charAt(0).toUpperCase()}
-            </div>
-            <div className="flex-1 min-w-0">
-              <h2 className="text-[20px] font-semibold text-text truncate">{profile.display_name}</h2>
-              <p className="text-[14px] text-text-muted font-mono">@{profile.username}</p>
-              <div className="flex items-center space-x-1.5 text-[12px] text-text-muted mt-1">
-                <Calendar className="w-3.5 h-3.5" />
-                <span>
-                  Member since {new Date(profile.created_at).toLocaleDateString(undefined, {
-                    year: 'numeric',
-                    month: 'short',
-                    day: 'numeric',
-                  })}
-                </span>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start space-x-3 min-w-0">
+              <div className="w-12 h-12 rounded-sm bg-primary text-on-primary flex items-center justify-center font-semibold text-[20px] shrink-0">
+                {profile.display_name.charAt(0).toUpperCase()}
               </div>
+              <div className="min-w-0">
+                <h2 className="text-[20px] font-semibold text-text truncate">{profile.display_name}</h2>
+                <p className="text-[14px] text-text-muted font-mono">@{profile.username}</p>
+                <div className="flex items-center space-x-1.5 text-[12px] text-text-muted mt-1">
+                  <Calendar className="w-3.5 h-3.5" />
+                  <span>
+                    Joined {new Date(profile.created_at).toLocaleDateString(undefined, {
+                      year: 'numeric',
+                      month: 'short',
+                      day: 'numeric',
+                    })}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Follow / Edit Button */}
+            {isSelf ? (
+              <button
+                type="button"
+                onClick={onNavigateToEditProfile}
+                className="min-h-[44px] px-3.5 rounded-sm border border-border bg-surface hover:bg-bg text-text text-[13px] font-semibold transition-colors cursor-pointer shrink-0"
+              >
+                Edit Profile
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleToggleFollow}
+                disabled={togglingFollow}
+                className={`min-h-[44px] px-4 rounded-sm font-semibold text-[13px] flex items-center space-x-1.5 transition-colors cursor-pointer shrink-0 ${
+                  profile.is_following
+                    ? 'border border-border bg-bg text-text hover:border-danger hover:text-danger'
+                    : 'border border-primary bg-primary-tint text-primary hover:bg-primary hover:text-on-primary'
+                }`}
+              >
+                {profile.is_following ? (
+                  <>
+                    <UserCheck className="w-4 h-4" />
+                    <span>Following</span>
+                  </>
+                ) : (
+                  <>
+                    <UserPlus className="w-4 h-4" />
+                    <span>Follow</span>
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+
+          {/* Social Stats */}
+          <div className="flex items-center space-x-6 py-2 border-y border-border text-[13px]">
+            <div>
+              <span className="font-semibold text-text">{profile.followers_count ?? 0}</span>{' '}
+              <span className="text-text-muted">Followers</span>
+            </div>
+            <div>
+              <span className="font-semibold text-text">{profile.following_count ?? 0}</span>{' '}
+              <span className="text-text-muted">Following</span>
             </div>
           </div>
 

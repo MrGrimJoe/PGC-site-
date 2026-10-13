@@ -11,10 +11,13 @@ describe('Migrations runner', () => {
     const result = await runMigrations(db);
 
     expect(result.applied).toContain('001_init.sql');
+    expect(result.applied).toContain('002_social.sql');
 
-    // Verify _migrations tracking table contains 001_init.sql
+    // Verify _migrations tracking table contains both migrations
     const migrationsRows = await db.prepare('SELECT name FROM _migrations').all<{ name: string }>();
-    expect(migrationsRows.results.map((r) => r.name)).toContain('001_init.sql');
+    const migrationNames = migrationsRows.results.map((r) => r.name);
+    expect(migrationNames).toContain('001_init.sql');
+    expect(migrationNames).toContain('002_social.sql');
 
     // Verify all required tables exist
     const tablesQuery = await db
@@ -28,6 +31,13 @@ describe('Migrations runner', () => {
     expect(tableNames).toContain('profiles');
     expect(tableNames).toContain('user_settings');
     expect(tableNames).toContain('sessions');
+    expect(tableNames).toContain('posts');
+    expect(tableNames).toContain('media');
+    expect(tableNames).toContain('post_media');
+    expect(tableNames).toContain('post_reactions');
+    expect(tableNames).toContain('comments');
+    expect(tableNames).toContain('follows');
+    expect(tableNames).toContain('reports');
     expect(tableNames).toContain('_migrations');
 
     // Verify indexes exist
@@ -40,8 +50,8 @@ describe('Migrations runner', () => {
     const indexNames = indexQuery.results.map((r) => r.name);
     expect(indexNames).toContain('idx_users_provider_subject');
     expect(indexNames).toContain('idx_profiles_username_normalized');
-    expect(indexNames).toContain('idx_sessions_user_id');
-    expect(indexNames).toContain('idx_sessions_expires_at');
+    expect(indexNames).toContain('idx_posts_feed');
+    expect(indexNames).toContain('idx_posts_expires_at');
   });
 
   it('is idempotent when run multiple times', async () => {
@@ -49,9 +59,9 @@ describe('Migrations runner', () => {
 
     // First run
     const firstRun = await runMigrations(db);
-    expect(firstRun.applied.length).toBeGreaterThan(0);
+    expect(firstRun.applied.length).toBe(2);
 
-    // Second run: should not re-run 001_init.sql
+    // Second run: should not re-run applied migrations
     const secondRun = await runMigrations(db);
     expect(secondRun.applied.length).toBe(0);
   });

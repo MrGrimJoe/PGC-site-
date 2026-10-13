@@ -1,15 +1,16 @@
-/**
- * Environment variables and bindings for the Cloudflare Worker.
- */
+import type { D1Database, R2Bucket } from '@cloudflare/workers-types';
+
 export interface Env {
   // Cloudflare D1 Database binding
   DB: D1Database;
 
-  // Cloudflare R2 Bucket binding
+  // Cloudflare R2 Bucket binding for media storage
   MEDIA_BUCKET?: R2Bucket;
 
-  // Google OAuth credentials
+  // Google OAuth 2.0 Web Client ID
   GOOGLE_CLIENT_ID: string;
+
+  // Google OAuth 2.0 Client Secret
   GOOGLE_CLIENT_SECRET: string;
 
   // Canonical base application URL (e.g. http://localhost:3000 or production domain)
@@ -45,6 +46,62 @@ export interface SessionRow {
   id: string;
   user_id: string;
   expires_at: string;
+}
+
+export interface PostRow {
+  id: string;
+  author_id: string;
+  body: string;
+  created_at: string;
+  expires_at: string;
+  status: string;
+}
+
+export interface MediaRow {
+  id: string;
+  owner_id: string;
+  object_key: string;
+  mime_type: string;
+  size_bytes: number;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface PostMediaRow {
+  post_id: string;
+  media_id: string;
+}
+
+export interface PostReactionRow {
+  post_id: string;
+  user_id: string;
+  type: string;
+  created_at: string;
+}
+
+export interface CommentRow {
+  id: string;
+  post_id: string;
+  author_id: string;
+  body: string;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface FollowRow {
+  follower_id: string;
+  followed_id: string;
+  created_at: string;
+}
+
+export interface ReportRow {
+  id: string;
+  reporter_id: string;
+  target_type: string;
+  target_id: string;
+  reason: string;
+  status: string;
+  created_at: string;
 }
 
 export interface OAuthStatePayload {
