@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import type { MeResponse } from '../../shared/schema.ts';
 import { normalizeUsername, isValidUsername } from '../../shared/username.ts';
 import { updateProfileSchema } from '../../shared/schema.ts';
-import { Save, AlertCircle, CheckCircle, Trash2, ShieldAlert, User, AtSign, Settings } from 'lucide-react';
+import { Save, Trash2, AlertTriangle, CheckCircle2 } from 'lucide-react';
 
 interface ProfileEditPageProps {
   currentUser: MeResponse;
@@ -30,7 +30,7 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
   const [deleteConfirmationText, setDeleteConfirmationText] = useState('');
   const [deleting, setDeleting] = useState(false);
 
-  // Real-time username normalization and validation check
+  // Real-time username validation
   const normalizedPreview = normalizeUsername(username);
   const isUsernameValid = isValidUsername(normalizedPreview);
 
@@ -38,7 +38,6 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
     e.preventDefault();
     setMessage(null);
 
-    // Validate using shared zod schema
     const payload = {
       username: normalizedPreview !== currentUser.profile.username ? normalizedPreview : undefined,
       display_name: displayName,
@@ -71,7 +70,7 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
       }
 
       onProfileUpdated(data);
-      setMessage({ type: 'success', text: 'Profile updated successfully!' });
+      setMessage({ type: 'success', text: 'Profile updated successfully.' });
     } catch (err) {
       setMessage({ type: 'error', text: (err as Error).message });
     } finally {
@@ -103,121 +102,118 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
   };
 
   return (
-    <div className="max-w-2xl mx-auto py-8 px-4 space-y-8">
+    <div className="w-full max-w-[640px] mx-auto py-8 px-4 space-y-4">
       {/* Header Info */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-zinc-800">
+      <div className="flex items-center justify-between gap-2 pb-2 border-b border-border">
         <div>
-          <h1 className="text-2xl font-bold text-zinc-100">Edit Profile & Settings</h1>
-          <p className="text-xs text-zinc-400 mt-1 font-mono">
-            User ID: <span className="text-zinc-300">{currentUser.user.id}</span> · Status:{' '}
-            <span className="text-emerald-400 capitalize">{currentUser.user.status}</span>
+          <h1 className="text-[24px] font-semibold text-text tracking-tight">Edit Profile</h1>
+          <p className="text-[12px] text-text-muted mt-0.5">
+            ID: <span className="font-mono text-text">{currentUser.user.id}</span>
           </p>
         </div>
         <button
+          type="button"
           onClick={() => onViewPublicProfile(currentUser.profile.username)}
-          className="text-xs px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition flex items-center space-x-1.5 self-start cursor-pointer"
+          className="min-h-[44px] px-3 rounded-sm border border-border bg-surface text-text hover:bg-primary-tint text-[14px] font-semibold transition-colors cursor-pointer"
         >
-          <span>View Public Profile</span>
+          View Profile
         </button>
       </div>
 
+      {/* Inline Feedback Alerts */}
       {message && (
         <div
-          className={`p-4 rounded-xl flex items-start space-x-3 text-sm ${
+          className={`p-3 rounded-sm border flex items-start space-x-2 text-[14px] ${
             message.type === 'success'
-              ? 'bg-emerald-950/40 border border-emerald-800/60 text-emerald-200'
-              : 'bg-red-950/40 border border-red-800/60 text-red-200'
+              ? 'bg-primary-tint border-primary text-primary'
+              : 'bg-danger-tint border-danger text-danger'
           }`}
         >
           {message.type === 'success' ? (
-            <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+            <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5" />
           ) : (
-            <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
           )}
           <span>{message.text}</span>
         </div>
       )}
 
-      {/* Main Profile Form */}
-      <form onSubmit={handleSubmit} className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 space-y-6">
+      {/* Main Profile Form Card */}
+      <form onSubmit={handleSubmit} className="bg-surface border border-border rounded-card p-4 shadow-card space-y-4">
         {/* Username */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold uppercase tracking-wider text-zinc-300 flex items-center space-x-1.5">
-            <AtSign className="w-3.5 h-3.5 text-indigo-400" />
-            <span>Username</span>
+        <div className="space-y-1">
+          <label htmlFor="input-username" className="block text-[12px] font-semibold text-text">
+            Username
           </label>
-          <div className="relative">
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="w-full bg-zinc-950 border border-zinc-700 rounded-xl px-3.5 py-2.5 text-zinc-100 text-sm focus:outline-none focus:border-indigo-500 font-mono"
-              placeholder="e.g. alice_123"
-              minLength={3}
-              maxLength={20}
-              required
-            />
-          </div>
-          <div className="flex items-center justify-between text-xs">
-            <span className="text-zinc-400">
-              3-20 characters, lowercase letters, digits, underscores only.
-            </span>
-            <span
-              className={`font-mono ${
-                isUsernameValid ? 'text-emerald-400' : 'text-amber-400'
-              }`}
-            >
-              {isUsernameValid ? `Valid: @${normalizedPreview}` : 'Invalid format'}
-            </span>
+          <input
+            id="input-username"
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            className="w-full min-h-[44px] bg-surface border border-border rounded-sm px-3 py-2 text-[14px] text-text font-mono focus:border-primary transition-colors"
+            placeholder="e.g. alice_123"
+            minLength={3}
+            maxLength={20}
+            required
+          />
+          <div className="flex justify-between items-center text-[12px] pt-0.5">
+            <span className="text-text-muted">3–20 lowercase letters, digits, underscores</span>
+            {!isUsernameValid && (
+              <span className="text-danger font-semibold">Invalid username format</span>
+            )}
+            {isUsernameValid && (
+              <span className="text-text-muted font-mono">@{normalizedPreview}</span>
+            )}
           </div>
         </div>
 
         {/* Display Name */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-semibold uppercase tracking-wider text-zinc-300 flex items-center space-x-1.5">
-            <User className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Display Name</span>
+        <div className="space-y-1">
+          <label htmlFor="input-displayname" className="block text-[12px] font-semibold text-text">
+            Display Name
           </label>
           <input
+            id="input-displayname"
             type="text"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-700 rounded-xl px-3.5 py-2.5 text-zinc-100 text-sm focus:outline-none focus:border-emerald-500"
+            className="w-full min-h-[44px] bg-surface border border-border rounded-sm px-3 py-2 text-[14px] text-text focus:border-primary transition-colors"
             placeholder="e.g. Alice Wonderland"
             maxLength={50}
             required
           />
-          <p className="text-xs text-zinc-400">Public name displayed on your profile (1-50 chars).</p>
+          <p className="text-[12px] text-text-muted">1–50 characters</p>
         </div>
 
-        {/* Bio */}
-        <div className="space-y-1.5">
+        {/* Biography */}
+        <div className="space-y-1">
           <div className="flex justify-between items-center">
-            <label className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+            <label htmlFor="input-bio" className="block text-[12px] font-semibold text-text">
               Biography
             </label>
-            <span className="text-xs text-zinc-400">{bio.length} / 500</span>
+            <span className="text-[12px] text-text-muted">{bio.length} / 500</span>
           </div>
           <textarea
+            id="input-bio"
             value={bio}
             onChange={(e) => setBio(e.target.value)}
             rows={3}
             maxLength={500}
-            className="w-full bg-zinc-950 border border-zinc-700 rounded-xl px-3.5 py-2.5 text-zinc-100 text-sm focus:outline-none focus:border-cyan-500 resize-none"
-            placeholder="Tell the community about yourself..."
+            className="w-full bg-surface border border-border rounded-sm p-3 text-[14px] text-text focus:border-primary resize-none transition-colors"
+            placeholder="Tell others about yourself..."
           />
         </div>
 
-        {/* Settings: DM Policy */}
-        <div className="pt-2 border-t border-zinc-800 space-y-2">
-          <label className="text-xs font-semibold uppercase tracking-wider text-zinc-300 flex items-center space-x-1.5">
-            <Settings className="w-3.5 h-3.5 text-purple-400" />
-            <span>Direct Message Policy (Settings)</span>
+        {/* DM Policy */}
+        <div className="space-y-1">
+          <label htmlFor="select-dmpolicy" className="block text-[12px] font-semibold text-text">
+            Direct Message Policy
           </label>
           <select
+            id="select-dmpolicy"
             value={dmPolicy}
             onChange={(e) => setDmPolicy(e.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-700 rounded-xl px-3.5 py-2.5 text-zinc-100 text-sm focus:outline-none focus:border-purple-500"
+            className="w-full min-h-[44px] bg-surface border border-border rounded-sm px-3 py-2 text-[14px] text-text focus:border-primary transition-colors cursor-pointer"
           >
             <option value="everyone">Everyone can message</option>
             <option value="following">Only users I follow</option>
@@ -225,58 +221,65 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
           </select>
         </div>
 
+        {/* The ONE Primary Blue Button on Screen */}
         <button
           type="submit"
           disabled={saving || !isUsernameValid}
-          className="w-full flex items-center justify-center space-x-2 py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium transition shadow-md shadow-indigo-600/20 disabled:opacity-50 cursor-pointer"
+          className="w-full min-h-[44px] px-4 rounded-sm bg-primary hover:bg-primary-hover text-on-primary font-semibold text-[14px] flex items-center justify-center space-x-2 transition-colors disabled:opacity-50 cursor-pointer"
         >
           <Save className="w-4 h-4" />
-          <span>{saving ? 'Saving Changes...' : 'Save Profile (PATCH /api/me)'}</span>
+          <span>{saving ? 'Saving...' : 'Save Profile'}</span>
         </button>
       </form>
 
-      {/* Danger Zone: Account Deletion */}
-      <div className="bg-red-950/20 border border-red-900/40 rounded-2xl p-6 space-y-4">
-        <div className="flex items-center space-x-2 text-red-400 font-semibold text-sm">
-          <ShieldAlert className="w-5 h-5 text-red-400" />
-          <span>Danger Zone: Account Deletion</span>
+      {/* Danger Zone Card */}
+      <div className="bg-surface border border-border rounded-card p-4 shadow-card space-y-2">
+        <div className="flex items-center space-x-2">
+          <span className="w-2 h-2 rounded-pill bg-danger inline-block" />
+          <h2 className="text-[14px] font-semibold text-danger">Delete Account</h2>
         </div>
-        <p className="text-xs text-zinc-400 leading-relaxed">
-          Deleting your account executes <code className="text-red-300">DELETE /api/me</code>. This permanently removes your user record, profile, settings, and active sessions from Cloudflare D1. This action is irreversible.
+        <p className="text-[12px] text-text-muted leading-relaxed">
+          Permanently removes your account, profile, settings, and sessions from the database. This action cannot be reversed.
         </p>
         <button
           type="button"
           onClick={() => setShowDeleteModal(true)}
-          className="px-4 py-2 rounded-xl bg-red-950 hover:bg-red-900/80 text-red-300 border border-red-800/80 text-xs font-semibold transition flex items-center space-x-2 cursor-pointer"
+          className="min-h-[44px] px-4 rounded-sm border border-danger text-danger bg-surface hover:bg-danger-tint text-[14px] font-semibold flex items-center space-x-2 transition-colors cursor-pointer"
         >
           <Trash2 className="w-4 h-4" />
-          <span>Delete My Account</span>
+          <span>Delete Account</span>
         </button>
       </div>
 
       {/* Delete Confirmation Modal */}
       {showDeleteModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-zinc-900 border border-red-900/60 rounded-2xl p-6 max-w-md w-full space-y-4 shadow-2xl">
-            <h3 className="text-lg font-bold text-red-400 flex items-center space-x-2">
-              <ShieldAlert className="w-5 h-5" />
+        <div className="fixed inset-0 z-50 bg-[#17233A]/40 flex items-center justify-center p-4">
+          <div className="bg-surface border border-border rounded-card p-4 max-w-[420px] w-full space-y-4 shadow-card">
+            <h3 className="text-[16px] font-semibold text-danger flex items-center space-x-2">
+              <AlertTriangle className="w-5 h-5" />
               <span>Confirm Account Deletion</span>
             </h3>
-            <p className="text-xs text-zinc-300">
-              Type <strong className="text-white font-mono">DELETE</strong> below to permanently delete your account and all associated D1 database records.
+            <p className="text-[14px] text-text">
+              Type <strong className="font-mono text-text">DELETE</strong> below to confirm permanent removal.
             </p>
-            <input
-              type="text"
-              value={deleteConfirmationText}
-              onChange={(e) => setDeleteConfirmationText(e.target.value)}
-              placeholder="Type DELETE to confirm"
-              className="w-full bg-zinc-950 border border-zinc-700 rounded-xl px-3 py-2 text-sm text-zinc-100 font-mono focus:outline-none focus:border-red-500"
-            />
-            <div className="flex space-x-3 pt-2">
+            <div>
+              <label htmlFor="confirm-delete-input" className="block text-[12px] font-semibold text-text mb-1">
+                Confirmation Text
+              </label>
+              <input
+                id="confirm-delete-input"
+                type="text"
+                value={deleteConfirmationText}
+                onChange={(e) => setDeleteConfirmationText(e.target.value)}
+                placeholder="Type DELETE"
+                className="w-full min-h-[44px] bg-surface border border-border rounded-sm px-3 py-2 text-[14px] font-mono text-text focus:border-danger"
+              />
+            </div>
+            <div className="flex space-x-2 pt-1">
               <button
                 type="button"
                 onClick={() => setShowDeleteModal(false)}
-                className="flex-1 py-2 px-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium cursor-pointer"
+                className="flex-1 min-h-[44px] px-3 rounded-sm border border-border bg-surface text-text hover:bg-bg text-[14px] font-semibold transition-colors cursor-pointer"
               >
                 Cancel
               </button>
@@ -284,9 +287,9 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
                 type="button"
                 onClick={handleDeleteAccount}
                 disabled={deleteConfirmationText !== 'DELETE' || deleting}
-                className="flex-1 py-2 px-3 rounded-xl bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-xs font-semibold transition cursor-pointer"
+                className="flex-1 min-h-[44px] px-3 rounded-sm bg-danger hover:opacity-90 disabled:opacity-40 text-on-primary text-[14px] font-semibold transition-colors cursor-pointer"
               >
-                {deleting ? 'Deleting...' : 'Permanently Delete'}
+                {deleting ? 'Deleting...' : 'Confirm Delete'}
               </button>
             </div>
           </div>

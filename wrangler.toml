@@ -1,4 +1,4 @@
-name = "dialtone-worker"
+name = "dialtone"
 main = "worker/index.ts"
 compatibility_date = "2024-04-05"
 
@@ -13,8 +13,10 @@ database_id = "placeholder-d1-id"
 binding = "MEDIA_BUCKET"
 bucket_name = "dialtone-media"
 
-# Environment variables
+# Non-secret environment variables
 [vars]
 ENVIRONMENT = "production"
-APP_URL = "https://dialtone.app"
-GOOGLE_CLIENT_ID = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
+# Secrets (configure via `npx wrangler secret put <KEY>`):
+# - GOOGLE_CLIENT_ID
+# - GOOGLE_CLIENT_SECRET
+# - APP_URL

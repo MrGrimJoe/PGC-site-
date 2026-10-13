@@ -15,9 +15,6 @@ export interface Env {
   // Canonical base application URL (e.g. http://localhost:3000 or production domain)
   APP_URL: string;
 
-  // Optional session encryption secret
-  SESSION_SECRET?: string;
-
   // Environment mode (e.g., development, production, test)
   ENVIRONMENT?: string;
 }

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import type { PublicProfileResponse } from '../../shared/schema.ts';
-import { Search, User, Calendar, Shield, AlertCircle } from 'lucide-react';
+import { Search, User, Calendar, AlertCircle } from 'lucide-react';
 
 interface ProfileViewPageProps {
   initialUsername?: string;
@@ -19,6 +19,9 @@ export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({ initialUsernam
     try {
       const res = await fetch(`/api/users/${encodeURIComponent(u.trim())}`);
       if (!res.ok) {
+        if (res.status === 401) {
+          throw new Error('Please sign in to search and view user profiles.');
+        }
         if (res.status === 404) {
           throw new Error(`User "@${u.trim()}" not found.`);
         }
@@ -47,60 +50,65 @@ export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({ initialUsernam
   };
 
   return (
-    <div className="max-w-2xl mx-auto py-8 px-4 space-y-6">
-      {/* Header and Lookup Bar */}
+    <div className="w-full max-w-[640px] mx-auto py-8 px-4 space-y-4">
+      {/* Title */}
       <div>
-        <h1 className="text-2xl font-bold text-zinc-100">Public Profile Directory</h1>
-        <p className="text-xs text-zinc-400 mt-1">
-          Look up any registered member via <code className="text-zinc-300">GET /api/users/:username</code>
+        <h1 className="text-[24px] font-semibold text-text tracking-tight">User Directory</h1>
+        <p className="text-[14px] text-text-muted mt-0.5">
+          Look up public profiles across the network
         </p>
       </div>
 
-      <form onSubmit={handleSearchSubmit} className="flex gap-2">
-        <div className="relative flex-1">
-          <Search className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-          <input
-            type="text"
-            value={searchUsername}
-            onChange={(e) => setSearchUsername(e.target.value)}
-            placeholder="Search by username (e.g. alice, bob)..."
-            className="w-full bg-zinc-900 border border-zinc-800 rounded-xl pl-10 pr-4 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-cyan-500 font-mono"
-          />
+      {/* Search Card */}
+      <form onSubmit={handleSearchSubmit} className="bg-surface border border-border rounded-card p-4 shadow-card space-y-3">
+        <div className="space-y-1">
+          <label htmlFor="search-username-input" className="block text-[12px] font-semibold text-text">
+            Search by Username
+          </label>
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                id="search-username-input"
+                type="text"
+                value={searchUsername}
+                onChange={(e) => setSearchUsername(e.target.value)}
+                placeholder="e.g. alice_123"
+                className="w-full min-h-[44px] bg-surface border border-border rounded-sm pl-9 pr-3 py-2 text-[14px] text-text font-mono focus:border-primary transition-colors"
+              />
+            </div>
+            {/* The ONE Primary Blue Button on Screen */}
+            <button
+              type="submit"
+              disabled={loading || !searchUsername.trim()}
+              className="min-h-[44px] px-4 rounded-sm bg-primary hover:bg-primary-hover text-on-primary text-[14px] font-semibold flex items-center justify-center transition-colors disabled:opacity-50 cursor-pointer"
+            >
+              {loading ? 'Searching...' : 'Search'}
+            </button>
+          </div>
         </div>
-        <button
-          type="submit"
-          disabled={loading || !searchUsername.trim()}
-          className="px-5 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-medium transition disabled:opacity-50 cursor-pointer"
-        >
-          {loading ? 'Searching...' : 'Find Profile'}
-        </button>
       </form>
 
-      {/* Error state */}
+      {/* Inline Error State */}
       {error && (
-        <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-900/50 flex items-start space-x-3 text-sm text-amber-200">
-          <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-          <div>
-            <p className="font-semibold">{error}</p>
-            <p className="text-xs text-amber-300/80 mt-1">
-              Verify the username spelling or register the account first.
-            </p>
-          </div>
+        <div className="p-3 rounded-sm border border-danger bg-danger-tint text-danger flex items-start space-x-2 text-[14px]">
+          <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+          <span>{error}</span>
         </div>
       )}
 
       {/* Profile Card */}
       {profile && (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 sm:p-8 space-y-6 shadow-xl">
-          <div className="flex items-start space-x-4">
-            <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-cyan-600 to-indigo-600 flex items-center justify-center text-white font-bold text-2xl shadow-lg shadow-cyan-500/10 shrink-0">
+        <div className="bg-surface border border-border rounded-card p-4 shadow-card space-y-4">
+          <div className="flex items-start space-x-3">
+            <div className="w-12 h-12 rounded-sm bg-primary text-on-primary flex items-center justify-center font-semibold text-[20px] shrink-0">
               {profile.display_name.charAt(0).toUpperCase()}
             </div>
             <div className="flex-1 min-w-0">
-              <h2 className="text-xl font-bold text-zinc-100 truncate">{profile.display_name}</h2>
-              <p className="text-sm text-cyan-400 font-mono">@{profile.username}</p>
-              <div className="flex items-center space-x-1.5 text-xs text-zinc-400 mt-2">
-                <Calendar className="w-3.5 h-3.5 text-zinc-500" />
+              <h2 className="text-[20px] font-semibold text-text truncate">{profile.display_name}</h2>
+              <p className="text-[14px] text-text-muted font-mono">@{profile.username}</p>
+              <div className="flex items-center space-x-1.5 text-[12px] text-text-muted mt-1">
+                <Calendar className="w-3.5 h-3.5" />
                 <span>
                   Member since {new Date(profile.created_at).toLocaleDateString(undefined, {
                     year: 'numeric',
@@ -112,30 +120,32 @@ export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({ initialUsernam
             </div>
           </div>
 
-          {/* Bio */}
-          <div className="bg-zinc-950/70 border border-zinc-800/80 rounded-xl p-4">
-            <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block mb-1">
+          {/* About Section */}
+          <div className="border border-border rounded-sm p-3 bg-bg">
+            <span className="text-[12px] font-semibold text-text block mb-1">
               About
             </span>
-            <p className="text-sm text-zinc-200 whitespace-pre-wrap leading-relaxed">
-              {profile.bio || <span className="italic text-zinc-500">No biography provided yet.</span>}
+            <p className="text-[14px] text-text whitespace-pre-wrap leading-relaxed">
+              {profile.bio || <span className="text-text-muted italic">No biography provided.</span>}
             </p>
-          </div>
-
-          {/* Privacy Note */}
-          <div className="border-t border-zinc-800 pt-4 flex items-center space-x-2 text-xs text-zinc-500">
-            <Shield className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>
-              Public profile fields only: username, display_name, bio, avatar_media_id, created_at. Provider IDs and settings remain protected.
-            </span>
           </div>
         </div>
       )}
 
+      {/* Clear Empty State */}
       {!profile && !error && !loading && (
-        <div className="text-center py-12 border border-dashed border-zinc-800 rounded-2xl text-zinc-500 text-sm">
-          <User className="w-8 h-8 text-zinc-600 mx-auto mb-2" />
-          <p>Enter a username above to inspect their public profile.</p>
+        <div className="text-center py-10 border border-dashed border-border rounded-card bg-surface text-text-muted text-[14px] space-y-1">
+          <User className="w-7 h-7 mx-auto mb-1 text-text-muted" />
+          <p className="font-semibold text-text">No profile selected</p>
+          <p className="text-[12px]">Enter a username above to inspect their profile.</p>
+        </div>
+      )}
+
+      {/* Loading State */}
+      {loading && (
+        <div className="text-center py-10 border border-border rounded-card bg-surface text-text-muted text-[14px]">
+          <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-pill animate-spin mx-auto mb-2" />
+          <p>Loading profile...</p>
         </div>
       )}
     </div>

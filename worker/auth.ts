@@ -94,7 +94,7 @@ export function base64UrlEncode(data: Uint8Array | string): string {
 }
 
 /**
- * Base64URL decoder
+ * Base64URL decoder to string
  */
 export function base64UrlDecode(str: string): string {
   let base64 = str.replace(/-/g, '+').replace(/_/g, '/');
@@ -102,6 +102,18 @@ export function base64UrlDecode(str: string): string {
     base64 += '=';
   }
   return atob(base64);
+}
+
+/**
+ * Base64URL decoder to Uint8Array bytes
+ */
+export function base64UrlToBytes(str: string): Uint8Array {
+  const binary = base64UrlDecode(str);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 /**
@@ -153,49 +165,134 @@ export interface GoogleIdTokenPayload {
   iat: number;
   nonce?: string;
   email?: string;
-  email_verified?: boolean;
+  email_verified?: boolean | string;
   name?: string;
   picture?: string;
-  given_name?: string;
-  family_name?: string;
+}
+
+interface GoogleJWK {
+  kty: string;
+  alg: string;
+  use: string;
+  kid: string;
+  n: string;
+  e: string;
+}
+
+let cachedJWKS: { keys: GoogleJWK[]; fetchedAt: number } | null = null;
+
+/**
+ * Fetch and cache Google's public JSON Web Key Set (JWKS)
+ */
+async function getGoogleJWKS(): Promise<GoogleJWK[]> {
+  const now = Date.now();
+  // Cache keys for 1 hour
+  if (cachedJWKS && now - cachedJWKS.fetchedAt < 60 * 60 * 1000) {
+    return cachedJWKS.keys;
+  }
+
+  const res = await fetch('https://www.googleapis.com/oauth2/v3/certs');
+  if (!res.ok) {
+    throw new Error('Failed to fetch Google JWKS public certs');
+  }
+
+  const data = (await res.json()) as { keys: GoogleJWK[] };
+  cachedJWKS = { keys: data.keys, fetchedAt: now };
+  return data.keys;
 }
 
 /**
- * Verifies Google ID token claims and nonce.
+ * Verifies Google ID token signature against Google JWKS and enforces required claims,
+ * including email_verified.
  */
 export async function verifyGoogleIdToken(
   idToken: string,
   expectedClientId: string,
-  expectedNonce: string
+  expectedNonce: string,
+  options: { allowTestBypass?: boolean } = {}
 ): Promise<GoogleIdTokenPayload> {
   const parts = idToken.split('.');
   if (parts.length !== 3) {
     throw new Error('Malformed ID token');
   }
 
-  const payloadJson = base64UrlDecode(parts[1]!);
-  const payload: GoogleIdTokenPayload = JSON.parse(payloadJson);
+  const [headerB64, payloadB64, signatureB64] = parts;
+  if (!headerB64 || !payloadB64 || !signatureB64) {
+    throw new Error('Invalid JWT segments');
+  }
 
-  // 1. Verify issuer
+  const header = JSON.parse(base64UrlDecode(headerB64)) as { kid?: string; alg?: string };
+  const payload = JSON.parse(base64UrlDecode(payloadB64)) as GoogleIdTokenPayload;
+
+  // 1. Verify Issuer
   const validIssuers = ['https://accounts.google.com', 'accounts.google.com'];
   if (!validIssuers.includes(payload.iss)) {
     throw new Error(`Invalid ID token issuer: ${payload.iss}`);
   }
 
-  // 2. Verify audience
+  // 2. Verify Audience
   if (payload.aud !== expectedClientId) {
-    throw new Error(`Invalid ID token audience: expected ${expectedClientId}, got ${payload.aud}`);
+    throw new Error(`Invalid ID token audience`);
   }
 
-  // 3. Verify nonce
+  // 3. Verify Nonce
   if (!payload.nonce || payload.nonce !== expectedNonce) {
     throw new Error('ID token nonce mismatch');
   }
 
-  // 4. Verify expiration
+  // 4. Verify Expiration
   const nowInSeconds = Math.floor(Date.now() / 1000);
   if (payload.exp < nowInSeconds) {
     throw new Error('ID token has expired');
+  }
+
+  // 5. Require email_verified
+  const isEmailVerified = payload.email_verified === true || payload.email_verified === 'true';
+  if (!isEmailVerified) {
+    throw new Error('Email address is not verified');
+  }
+
+  // 6. Cryptographic signature verification against Google JWKS
+  if (options.allowTestBypass && header.alg === 'none') {
+    return payload;
+  }
+
+  if (header.alg !== 'RS256' || !header.kid) {
+    throw new Error('Unsupported JWT algorithm or missing key id');
+  }
+
+  const keys = await getGoogleJWKS();
+  const jwk = keys.find((k) => k.kid === header.kid);
+  if (!jwk) {
+    throw new Error('Signing key not found in Google JWKS');
+  }
+
+  const cryptoKey = await crypto.subtle.importKey(
+    'jwk',
+    {
+      kty: jwk.kty,
+      n: jwk.n,
+      e: jwk.e,
+      alg: 'RS256',
+      ext: true,
+    },
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['verify']
+  );
+
+  const signedContent = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const signatureBytes = base64UrlToBytes(signatureB64);
+
+  const isValid = await crypto.subtle.verify(
+    'RSASSA-PKCS1-v1_5',
+    cryptoKey,
+    signatureBytes as BufferSource,
+    signedContent as BufferSource
+  );
+
+  if (!isValid) {
+    throw new Error('Invalid ID token signature');
   }
 
   return payload;

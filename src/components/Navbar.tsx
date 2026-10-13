@@ -17,77 +17,73 @@ export const Navbar: React.FC<NavbarProps> = ({
   onLogout,
 }) => {
   return (
-    <header className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur sticky top-0 z-50">
-      <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
-        <div className="flex items-center space-x-3">
-          <div className="h-9 w-9 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-bold tracking-wider shadow-sm shadow-indigo-500/20">
+    <header className="border-b border-border bg-surface sticky top-0 z-40">
+      <div className="max-w-[640px] mx-auto px-4 h-16 flex items-center justify-between">
+        <div className="flex items-center space-x-2.5">
+          <div className="w-8 h-8 rounded-sm bg-primary text-on-primary flex items-center justify-center font-semibold text-base">
             D
           </div>
-          <div>
-            <div className="flex items-center space-x-2">
-              <span className="font-semibold text-zinc-100 text-lg tracking-tight">Dialtone</span>
-              <span className="text-xs bg-zinc-800 text-zinc-400 font-mono px-2 py-0.5 rounded border border-zinc-700/60">
-                Milestone 1
-              </span>
-            </div>
-            <p className="text-xs text-zinc-500 hidden sm:block">Cloudflare Worker · D1 · PKCE Auth</p>
+          <div className="flex items-center space-x-2">
+            <span className="font-semibold text-text text-base tracking-tight">Dialtone</span>
+            <span className="text-[12px] bg-accent text-accent-text font-semibold px-2 py-0.5 rounded-pill">
+              M1
+            </span>
           </div>
         </div>
 
         {/* Navigation Tabs */}
-        <nav className="flex items-center space-x-1 sm:space-x-2">
+        <nav className="flex items-center space-x-1">
           {!currentUser ? (
             <button
+              type="button"
               onClick={() => setActiveTab('signin')}
-              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition ${
+              className={`min-h-[44px] px-3 rounded-sm text-[14px] font-semibold flex items-center space-x-1.5 transition-colors cursor-pointer ${
                 activeTab === 'signin'
-                  ? 'bg-zinc-800 text-zinc-100 border border-zinc-700'
-                  : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900'
+                  ? 'bg-primary-tint text-primary'
+                  : 'text-text-muted hover:text-text hover:bg-bg'
               }`}
             >
-              <LogIn className="w-4 h-4 text-indigo-400" />
+              <LogIn className="w-4 h-4" />
               <span>Sign In</span>
             </button>
           ) : (
             <button
+              type="button"
               onClick={() => setActiveTab('edit')}
-              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition ${
+              className={`min-h-[44px] px-3 rounded-sm text-[14px] font-semibold flex items-center space-x-1.5 transition-colors cursor-pointer ${
                 activeTab === 'edit'
-                  ? 'bg-zinc-800 text-zinc-100 border border-zinc-700'
-                  : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900'
+                  ? 'bg-primary-tint text-primary'
+                  : 'text-text-muted hover:text-text hover:bg-bg'
               }`}
             >
-              <Edit3 className="w-4 h-4 text-emerald-400" />
+              <Edit3 className="w-4 h-4" />
               <span>Edit Profile</span>
             </button>
           )}
 
           <button
+            type="button"
             onClick={() => setActiveTab('view')}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition ${
+            className={`min-h-[44px] px-3 rounded-sm text-[14px] font-semibold flex items-center space-x-1.5 transition-colors cursor-pointer ${
               activeTab === 'view'
-                ? 'bg-zinc-800 text-zinc-100 border border-zinc-700'
-                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900'
+                ? 'bg-primary-tint text-primary'
+                : 'text-text-muted hover:text-text hover:bg-bg'
             }`}
           >
-            <Eye className="w-4 h-4 text-cyan-400" />
-            <span>Public Profile</span>
+            <Eye className="w-4 h-4" />
+            <span>Profile</span>
           </button>
 
           {currentUser && (
-            <div className="flex items-center pl-2 sm:pl-3 border-l border-zinc-800 space-x-2">
-              <div className="hidden md:flex flex-col text-right">
-                <span className="text-xs font-medium text-zinc-200">{currentUser.profile.display_name}</span>
-                <span className="text-[11px] text-zinc-400 font-mono">@{currentUser.profile.username}</span>
-              </div>
-              <button
-                onClick={onLogout}
-                title="Log out"
-                className="p-1.5 rounded-lg text-zinc-400 hover:text-red-400 hover:bg-red-950/30 transition border border-transparent hover:border-red-900/40"
-              >
-                <LogOut className="w-4 h-4" />
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={onLogout}
+              title="Log out"
+              aria-label="Log out"
+              className="min-h-[44px] min-w-[44px] p-2.5 rounded-sm text-text-muted hover:text-danger hover:bg-danger-tint transition-colors flex items-center justify-center cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
           )}
         </nav>
       </div>

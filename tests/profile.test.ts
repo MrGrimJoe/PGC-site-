@@ -167,9 +167,20 @@ describe('Profile Management and Access Control', () => {
     expect(data.error).toContain('Username is already taken');
   });
 
+  it('GET /api/users/:username requires a valid session', async () => {
+    const unauthReq = new Request('http://localhost:3000/api/users/bob_builder', {
+      method: 'GET',
+    });
+    const res = await worker.fetch(unauthReq, env);
+    expect(res.status).toBe(401);
+  });
+
   it('GET /api/users/:username returns public fields only and rejects hidden fields', async () => {
     const req = new Request('http://localhost:3000/api/users/bob_builder', {
       method: 'GET',
+      headers: {
+        Cookie: 'session_id=sess_alice',
+      },
     });
 
     const res = await worker.fetch(req, env);
@@ -195,6 +206,9 @@ describe('Profile Management and Access Control', () => {
   it('GET /api/users/:username is case-insensitive through username_normalized', async () => {
     const req = new Request('http://localhost:3000/api/users/BOB_BUILDER', {
       method: 'GET',
+      headers: {
+        Cookie: 'session_id=sess_alice',
+      },
     });
 
     const res = await worker.fetch(req, env);

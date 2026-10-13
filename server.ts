@@ -14,8 +14,23 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function startServer() {
-  const app = express();
+  const isDev = (process.env.NODE_ENV || 'development') === 'development';
   const PORT = Number(process.env.PORT || 3000);
+
+  // Outside development, strictly require all credentials and fail fast without fallback secrets
+  if (!isDev) {
+    const missing: string[] = [];
+    if (!process.env.GOOGLE_CLIENT_ID) missing.push('GOOGLE_CLIENT_ID');
+    if (!process.env.GOOGLE_CLIENT_SECRET) missing.push('GOOGLE_CLIENT_SECRET');
+    if (!process.env.APP_URL) missing.push('APP_URL');
+
+    if (missing.length > 0) {
+      console.error(`[Fatal] Missing required environment variables in production: ${missing.join(', ')}`);
+      process.exit(1);
+    }
+  }
+
+  const app = express();
 
   // Initialize SQLite-backed D1 database for local development
   const dbPath = path.resolve(__dirname, '.local-dev-d1.sqlite');
@@ -33,10 +48,11 @@ async function startServer() {
   const env: Env = {
     DB: d1,
     APP_URL: process.env.APP_URL || `http://localhost:${PORT}`,
-    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || 'PLACEHOLDER',
-    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || 'PLACEHOLDER',
-    SESSION_SECRET: process.env.SESSION_SECRET || 'dev-secret-key-12345',
-    ENVIRONMENT: process.env.NODE_ENV || 'development',
+    // DEV-ONLY: remove before launch
+    // Env vars may default to placeholder values ONLY in development
+    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || (isDev ? 'PLACEHOLDER' : ''),
+    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || (isDev ? 'PLACEHOLDER' : ''),
+    ENVIRONMENT: isDev ? 'development' : 'production',
   };
 
   // Mount API router directly to the Cloudflare Worker fetch handler
@@ -80,7 +96,6 @@ async function startServer() {
       // Write headers
       webResponse.headers.forEach((val, key) => {
         if (key.toLowerCase() === 'set-cookie') {
-          // Express set-cookie support for multiple headers
           const rawCookies = (webResponse.headers as any).getSetCookie
             ? (webResponse.headers as any).getSetCookie()
             : [val];
@@ -102,7 +117,8 @@ async function startServer() {
       res.end();
     } catch (err) {
       console.error('[Worker Error]', err);
-      res.status(500).json({ error: 'Internal Worker error', details: (err as Error).message });
+      // Generic error response without leaking internal server details to client
+      res.status(500).json({ error: 'Internal server error' });
     }
   });
 

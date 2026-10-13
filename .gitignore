@@ -10,3 +10,5 @@ coverage/
 *.sqlite-journal
 *.sqlite-shm
 *.sqlite-wal
+bun.lock
+bun.lockb
