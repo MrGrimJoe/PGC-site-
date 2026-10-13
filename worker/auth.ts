@@ -35,6 +35,7 @@ export function serializeCookie(
     httpOnly?: boolean;
     secure?: boolean;
     sameSite?: 'Lax' | 'Strict' | 'None';
+    partitioned?: boolean;
   } = {}
 ): string {
   const parts: string[] = [`${encodeURIComponent(name)}=${encodeURIComponent(value)}`];
@@ -58,6 +59,10 @@ export function serializeCookie(
 
   const sameSite = options.sameSite ?? 'Lax';
   parts.push(`SameSite=${sameSite}`);
+
+  if (options.partitioned) {
+    parts.push('Partitioned');
+  }
 
   return parts.join('; ');
 }

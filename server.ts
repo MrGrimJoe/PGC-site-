@@ -58,7 +58,12 @@ async function startServer() {
   // Mount API router directly to the Cloudflare Worker fetch handler
   app.all('/api/*', async (req, res) => {
     try {
-      const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+      // DEV-ONLY: remove before launch
+      // Build request URL from x-forwarded-proto and x-forwarded-host when present,
+      // so the worker sees the real public origin behind AI Studio's reverse proxy.
+      const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol;
+      const host = (req.headers['x-forwarded-host'] as string) || req.get('host') || 'localhost:3000';
+      const fullUrl = `${proto}://${host}${req.originalUrl}`;
 
       // Convert Express request to standard Web Request
       const headers = new Headers();

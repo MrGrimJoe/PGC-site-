@@ -40,10 +40,17 @@ export default {
     const pathname = url.pathname;
     const method = request.method.toUpperCase();
     const isDevelopment = env.ENVIRONMENT === 'development';
+    const isHttps = url.protocol === 'https:' || request.headers.get('x-forwarded-proto') === 'https';
 
     // DEV-ONLY: remove before launch
-    // In development only, set cookies without the Secure flag so sessions work on http://localhost (Safari rejects Secure cookies on http).
-    const cookieSecure = !isDevelopment;
+    // In development:
+    // - On HTTPS (e.g. AI Studio preview in an iframe), use SameSite=None; Secure; Partitioned so cookies work in third-party contexts.
+    // - On HTTP (e.g. http://localhost), use SameSite=Lax without Secure so Safari doesn't drop unencrypted cookies.
+    // In production:
+    // - Always enforce Secure; HttpOnly; SameSite=Lax.
+    const cookieSecure = isDevelopment ? isHttps : true;
+    const cookieSameSite = isDevelopment && isHttps ? ('None' as const) : ('Lax' as const);
+    const cookiePartitioned = isDevelopment && isHttps;
 
     // CORS / preflight
     if (method === 'OPTIONS') {
@@ -95,11 +102,11 @@ export default {
       googleAuthUrl.searchParams.set('prompt', 'select_account');
 
       // DEV-ONLY: remove before launch
+      // When ENVIRONMENT === 'development', use a relative Location header so the oauth_state cookie
+      // is always sent regardless of differences between APP_URL and the browser's host (e.g. preview proxy).
       const targetUrl =
         isMockRequested && isDevelopment
-          ? `${env.APP_URL || url.origin}/api/auth/callback?code=mock_code&state=${encodeURIComponent(
-              state
-            )}&mock=true`
+          ? `/api/auth/callback?code=mock_code&state=${encodeURIComponent(state)}&mock=true`
           : googleAuthUrl.toString();
 
       return new Response(null, {
@@ -107,11 +114,12 @@ export default {
         headers: {
           Location: targetUrl,
           'Set-Cookie': serializeCookie('oauth_state', oauthState, {
-            path: '/api/auth/callback',
+            path: '/',
             maxAge: 600, // 10 minutes
             httpOnly: true,
             secure: cookieSecure,
-            sameSite: 'Lax',
+            sameSite: cookieSameSite,
+            partitioned: cookiePartitioned,
           }),
         },
       });
@@ -127,14 +135,34 @@ export default {
         return jsonResponse({ error: 'Authentication failed' }, 400);
       }
 
+      // DEV-ONLY: remove before launch
+      const isMockCode = url.searchParams.get('mock') === 'true' || (code ? code.startsWith('mock_') : false);
+
+      if (isMockCode && !isDevelopment) {
+        return jsonResponse({ error: 'Mock authorization is disabled in production' }, 400);
+      }
+
       const cookies = parseCookies(request.headers.get('Cookie'));
       const rawOAuthCookie = cookies['oauth_state'];
 
-      if (!rawOAuthCookie) {
+      let oauthState = rawOAuthCookie ? decodeOAuthState(rawOAuthCookie) : null;
+
+      // DEV-ONLY: remove before launch
+      // If the browser/iframe blocked the transient oauth_state cookie during development mock login,
+      // fallback to creating the mock state so developer workflow is never blocked in third-party iframes.
+      if (!oauthState && isDevelopment && isMockCode) {
+        oauthState = {
+          state: stateParam || 'mock_state',
+          codeVerifier: 'mock_verifier',
+          nonce: stateParam || 'mock_nonce',
+          createdAt: Date.now(),
+        };
+      }
+
+      if (!rawOAuthCookie && (!isDevelopment || !isMockCode)) {
         return jsonResponse({ error: 'Missing OAuth state cookie' }, 400);
       }
 
-      const oauthState = decodeOAuthState(rawOAuthCookie);
       if (!oauthState) {
         return jsonResponse({ error: 'Invalid or expired OAuth state cookie' }, 400);
       }
@@ -146,13 +174,6 @@ export default {
 
       if (!code) {
         return jsonResponse({ error: 'Missing authorization code' }, 400);
-      }
-
-      // DEV-ONLY: remove before launch
-      const isMockCode = url.searchParams.get('mock') === 'true' || code.startsWith('mock_');
-
-      if (isMockCode && !isDevelopment) {
-        return jsonResponse({ error: 'Mock authorization is disabled in production' }, 400);
       }
 
       const redirectUri = `${env.APP_URL || url.origin}/api/auth/callback`;
@@ -268,7 +289,10 @@ export default {
 
       // Return redirect to frontend with session cookie and clear oauth_state
       const headers = new Headers();
-      headers.set('Location', `${env.APP_URL || url.origin}/`);
+      // DEV-ONLY: remove before launch
+      // Use relative Location header ("/") in development so the redirect stays on the request's host
+      const postLoginLocation = isDevelopment ? '/' : `${env.APP_URL}/`;
+      headers.set('Location', postLoginLocation);
       headers.append(
         'Set-Cookie',
         serializeCookie('session_id', sessionId, {
@@ -276,17 +300,19 @@ export default {
           maxAge: 30 * 24 * 60 * 60,
           httpOnly: true,
           secure: cookieSecure,
-          sameSite: 'Lax',
+          sameSite: cookieSameSite,
+          partitioned: cookiePartitioned,
         })
       );
       headers.append(
         'Set-Cookie',
         serializeCookie('oauth_state', '', {
-          path: '/api/auth/callback',
+          path: '/',
           maxAge: 0,
           httpOnly: true,
           secure: cookieSecure,
-          sameSite: 'Lax',
+          sameSite: cookieSameSite,
+          partitioned: cookiePartitioned,
         })
       );
 
@@ -314,7 +340,8 @@ export default {
             maxAge: 0,
             httpOnly: true,
             secure: cookieSecure,
-            sameSite: 'Lax',
+            sameSite: cookieSameSite,
+            partitioned: cookiePartitioned,
           }),
         }
       );
@@ -540,7 +567,8 @@ export default {
             maxAge: 0,
             httpOnly: true,
             secure: cookieSecure,
-            sameSite: 'Lax',
+            sameSite: cookieSameSite,
+            partitioned: cookiePartitioned,
           }),
         }
       );

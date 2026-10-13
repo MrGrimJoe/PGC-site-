@@ -130,7 +130,7 @@ describe('Google OAuth & Session Authentication', () => {
     expect(body.error).toContain('Invalid OAuth state parameter');
   });
 
-  it('auth callback with missing state cookie is rejected with 400', async () => {
+  it('auth callback with missing state cookie is rejected with 400 for non-mock codes', async () => {
     const req = new Request('http://localhost:3000/api/auth/callback?code=some_code&state=any_state', {
       method: 'GET',
     });
@@ -139,6 +139,24 @@ describe('Google OAuth & Session Authentication', () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain('Missing OAuth state cookie');
+  });
+
+  // DEV-ONLY: remove before launch
+  it('auth callback in dev mock flow gracefully succeeds even if iframe drops the transient oauth_state cookie', async () => {
+    const callbackUrl = 'http://localhost:3000/api/auth/callback?code=mock_code&state=mock_state_123&mock=true';
+    const req = new Request(callbackUrl, {
+      method: 'GET',
+    });
+
+    const res = await worker.fetch(req, env);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('Location')).toBe('/');
+
+    const setCookie = res.headers.get('Set-Cookie');
+    expect(setCookie).toContain('session_id=sess_');
+
+    const users = await env.DB.prepare('SELECT * FROM users').all();
+    expect(users.results.length).toBe(1);
   });
 
   // DEV-ONLY: remove before launch
@@ -182,6 +200,60 @@ describe('Google OAuth & Session Authentication', () => {
 
     const sessions = await env.DB.prepare('SELECT * FROM sessions').all();
     expect(sessions.results.length).toBe(1);
+  });
+
+  // DEV-ONLY: remove before launch
+  it('dev mock flow completes and sets session cookie on request host when APP_URL is a different host', async () => {
+    const diffHostEnv: Env = {
+      ...env,
+      APP_URL: 'https://different-host.example.com',
+      ENVIRONMENT: 'development',
+    };
+
+    // Step 1: Initiate mock OAuth from http://localhost:3000
+    const initReq = new Request('http://localhost:3000/api/auth/google?mock=true', { method: 'GET' });
+    const initRes = await worker.fetch(initReq, diffHostEnv);
+
+    expect(initRes.status).toBe(302);
+    const location = initRes.headers.get('Location');
+    expect(location).toBeDefined();
+
+    // Verify redirect is relative, not sending the user to different-host.example.com
+    expect(location).not.toContain('different-host.example.com');
+    expect(location).toMatch(/^\/api\/auth\/callback\?/);
+
+    const initSetCookie = initRes.headers.get('Set-Cookie');
+    expect(initSetCookie).toBeDefined();
+    expect(initSetCookie).toContain('oauth_state=');
+
+    // Extract cookie value for subsequent callback request
+    const cookieMatch = initSetCookie!.match(/oauth_state=([^;]+)/);
+    const oauthCookieValue = cookieMatch ? cookieMatch[1] : '';
+
+    // Step 2: Follow relative redirect on http://localhost:3000 with the oauth_state cookie
+    const callbackUrl = `http://localhost:3000${location}`;
+    const callbackReq = new Request(callbackUrl, {
+      method: 'GET',
+      headers: {
+        Cookie: `oauth_state=${oauthCookieValue}`,
+      },
+    });
+
+    const callbackRes = await worker.fetch(callbackReq, diffHostEnv);
+    expect(callbackRes.status).toBe(302);
+
+    // Verify post-login redirect is relative ("/") and does not redirect away to different-host
+    const postLoginLocation = callbackRes.headers.get('Location');
+    expect(postLoginLocation).toBe('/');
+
+    // Verify session cookie was set on the request's host
+    const sessionCookie = callbackRes.headers.get('Set-Cookie');
+    expect(sessionCookie).toBeDefined();
+    expect(sessionCookie).toContain('session_id=sess_');
+
+    // Verify user was inserted into D1
+    const users = await diffHostEnv.DB.prepare('SELECT * FROM users').all();
+    expect(users.results.length).toBe(1);
   });
 
   it('verifyGoogleIdToken requires email_verified', async () => {

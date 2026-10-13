@@ -96,6 +96,7 @@ For rapid local testing without active Google Cloud OAuth credentials, a dev-onl
 - **Visibility**: Rendered strictly when `import.meta.env.DEV === true`. It is completely stripped out of production builds (`npm run build`) via Vite dead-code elimination.
 - **Workflow**: Clicking "Sign in as test user" initiates `/api/auth/google?mock=true`. The worker validates state and nonce, generates a random username (`user_` + 6 random chars), creates an isolated D1 session, and sets session cookies without the `Secure` flag so `http://localhost` works across all browsers (including Safari).
 - **Production Guardrails**: In any environment other than `ENVIRONMENT === 'development'`, mock codes and mock flags are strictly rejected with HTTP 400.
+- **Embedded Preview Cookie Notice**: If the embedded preview or iframe blocks cookies, open the app in its own browser tab so session and state cookies are stored and sent normally.
 
 ### How to Remove Dev Mode Before Launch
 
