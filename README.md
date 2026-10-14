@@ -165,6 +165,8 @@ Update `database_id` in `wrangler.toml`.
 ### 2. Apply Migrations to Remote D1
 ```bash
 npx wrangler d1 execute dialtone-db --remote --file=./migrations/001_init.sql
+npx wrangler d1 execute dialtone-db --remote --file=./migrations/002_social.sql
+npx wrangler d1 execute dialtone-db --remote --file=./migrations/003_discovery.sql
 ```
 
 ### 3. Set Cloudflare Worker Secrets
@@ -172,6 +174,7 @@ npx wrangler d1 execute dialtone-db --remote --file=./migrations/001_init.sql
 npx wrangler secret put GOOGLE_CLIENT_ID
 npx wrangler secret put GOOGLE_CLIENT_SECRET
 npx wrangler secret put APP_URL
+npx wrangler secret put ADMIN_SECRET
 ```
 
 ### 4. Deploy
@@ -179,6 +182,22 @@ npx wrangler secret put APP_URL
 npm run build
 npx wrangler deploy
 ```
+
+---
+
+## Database Schemas Overview
+
+- **`001_init.sql`**: Core authentication, `users`, `profiles`, `user_settings`, and `sessions`.
+- **`002_social.sql`**: Social posts (7-day base lifecycle), R2 `media`, `post_media` links, `post_reactions` (likes), `comments`, `follows` (no self-follow), and `reports`.
+- **`003_discovery.sql`**: Discovery engine schema:
+  - `classes`: Campus classes and affiliations (`profiles.class_id`).
+  - `topics` & `post_topics`: Normalized hashtag & keyword extraction with confidence scoring.
+  - `user_topic_signals`: Dynamic interest scoring with a 14-day exponential decay half-life.
+  - `impressions`: View logging with deduplication and 30-day lifecycle retention.
+  - `feedback`: Explicit user feedback (`more_like_this`, `show_less`, `not_interested`).
+  - `trend_snapshots`: Aggregated trending topics across 24h and 7d rolling windows (minimum 3 distinct authors).
+  - `rate_limits`: D1-backed atomic window rate limiting table.
+  - Search indexes on `posts.body`.
 
 ---
 
@@ -190,6 +209,29 @@ npx wrangler deploy
 | `GET` | `/api/auth/callback` | No | Exchanges code, verifies ID token, sets session cookie |
 | `POST` | `/api/auth/logout` | No | Deletes session and clears cookie |
 | `GET` | `/api/users/:username` | **Yes** | Returns public profile fields only |
-| `GET` | `/api/me` | **Yes** | Returns current authenticated user profile & settings |
-| `PATCH` | `/api/me` | **Yes** | Updates current user's profile and settings via batch |
-| `DELETE` | `/api/me` | **Yes** | Permanently deletes user and associated rows via batch |
+| `GET` | `/api/me` | **Yes** | Returns current user profile, class, and settings |
+| `PATCH` | `/api/me` | **Yes** | Updates user profile (display name, bio, class_id) and settings |
+| `DELETE` | `/api/me` | **Yes** | Permanently deletes user, posts, media, and sessions |
+| `GET` | `/api/classes` | No | Returns list of available campus classes |
+| `GET` | `/api/feed` | **Yes** | Chronological or ranked discovery feed with cursor pagination |
+| `POST` | `/api/posts` | **Yes** | Creates post with #hashtag and keyword topic extraction (rate-limited) |
+| `GET` | `/api/posts/:id` | **Yes** | Retrieves single post with media, likes, comments, topics |
+| `DELETE` | `/api/posts/:id` | **Yes** | Author-only deletion of post and R2 media |
+| `POST` | `/api/posts/:id/likes` | **Yes** | Toggles like reaction on a post (+1 interest signal) |
+| `GET` | `/api/posts/:id/comments` | **Yes** | Retrieves comments for a post |
+| `POST` | `/api/posts/:id/comments` | **Yes** | Adds comment to a post (+3 interest signal, rate-limited) |
+| `DELETE` | `/api/comments/:id` | **Yes** | Author-only comment deletion |
+| `POST` | `/api/users/:id/follow` | **Yes** | Follows/unfollows user (no self-follow, rate-limited) |
+| `POST` | `/api/media/uploads` | **Yes** | Uploads image with Content-Length, 5MB, and magic bytes check (rate-limited) |
+| `GET` | `/api/media/:id` | **Yes** | Serves image bytes from R2 with `X-Content-Type-Options: nosniff` |
+| `POST` | `/api/reports` | **Yes** | Reports post, comment, or user (verifies target, single open report, rate-limited) |
+| `GET` | `/api/admin/reports` | Admin Secret | Lists moderation reports (401/403 auth check) |
+| `PATCH` | `/api/admin/reports/:id` | Admin Secret | Updates report status (`reviewed` or `dismissed`) |
+| `GET` | `/api/search` | **Yes** | Searches posts across class, campus, or all scopes (rate-limited) |
+| `GET` | `/api/trends` | **Yes** | Returns trending topics for 24h or 7d windows |
+| `GET` | `/api/me/interests` | **Yes** | Returns user topic interest profile with decayed weights |
+| `DELETE` | `/api/me/interests` | **Yes** | Resets user topic interest signals |
+| `POST` | `/api/feedback` | **Yes** | Logs `more_like_this`, `show_less`, or `not_interested` feedback |
+| `POST` | `/api/impressions` | **Yes** | Logs post impressions with hourly deduplication |
+| `POST` | `/api/jobs/cleanup-expired` | Dev / Admin Secret | Daily cron lifecycle job (deletes expired posts, orphan media, prunes impressions) |
+

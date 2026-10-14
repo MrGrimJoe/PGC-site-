@@ -116,6 +116,86 @@ CREATE INDEX IF NOT EXISTS idx_follows_followed ON follows(followed_id);
 CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_type, target_id);
 `;
 
+export const MIGRATION_003_DISCOVERY_SQL = `
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS classes (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE
+);
+
+INSERT OR IGNORE INTO classes (id, name) VALUES
+  ('cls_2025', 'Class of 2025'),
+  ('cls_2026', 'Class of 2026'),
+  ('cls_2027', 'Class of 2027'),
+  ('cls_2028', 'Class of 2028'),
+  ('cls_alumni', 'Alumni'),
+  ('cls_faculty', 'Faculty & Staff');
+
+CREATE TABLE IF NOT EXISTS topics (
+  id TEXT PRIMARY KEY,
+  slug TEXT UNIQUE NOT NULL,
+  display_name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS post_topics (
+  post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  confidence REAL NOT NULL DEFAULT 1.0,
+  PRIMARY KEY (post_id, topic_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_topic_signals (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  weight REAL NOT NULL DEFAULT 0.0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, topic_id)
+);
+
+CREATE TABLE IF NOT EXISTS impressions (
+  id TEXT PRIMARY KEY,
+  viewer_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  shown_at TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS feedback (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trend_snapshots (
+  id TEXT PRIMARY KEY,
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  window TEXT NOT NULL,
+  window_start TEXT NOT NULL,
+  score REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+  key TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY (key, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_body ON posts(body);
+CREATE INDEX IF NOT EXISTS idx_profiles_class ON profiles(class_id);
+CREATE INDEX IF NOT EXISTS idx_post_topics_topic ON post_topics(topic_id);
+CREATE INDEX IF NOT EXISTS idx_user_topic_signals_user ON user_topic_signals(user_id);
+CREATE INDEX IF NOT EXISTS idx_impressions_viewer_post ON impressions(viewer_id, post_id, shown_at);
+CREATE INDEX IF NOT EXISTS idx_impressions_shown_at ON impressions(shown_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_user_post ON feedback(user_id, post_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_post_type ON feedback(post_id, type);
+CREATE INDEX IF NOT EXISTS idx_trend_snapshots_window ON trend_snapshots(window, score DESC);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_key ON rate_limits(key, window_start);
+`;
+
 export interface MigrationRecord {
   name: string;
   sql: string;
@@ -129,6 +209,10 @@ export const MIGRATIONS: MigrationRecord[] = [
   {
     name: '002_social.sql',
     sql: MIGRATION_002_SOCIAL_SQL,
+  },
+  {
+    name: '003_discovery.sql',
+    sql: MIGRATION_003_DISCOVERY_SQL,
   },
 ];
 
@@ -150,6 +234,16 @@ export async function runMigrations(db: D1Database): Promise<{ applied: string[]
     if (!appliedSet.has(migration.name)) {
       // Execute the migration SQL
       await db.exec(migration.sql);
+
+      // Ensure class_id on profiles for backwards compatibility
+      try {
+        const cols = await db.prepare("PRAGMA table_info(profiles)").all<{ name: string }>();
+        if (cols.results && !cols.results.some((c) => c.name === 'class_id')) {
+          await db.exec('ALTER TABLE profiles ADD COLUMN class_id TEXT;');
+        }
+      } catch {
+        // Ignored if already added
+      }
 
       // Record migration as applied
       const now = new Date().toISOString();

@@ -1791,13 +1791,13 @@ export default {
 
     // GET /api/admin/reports - Retrieve all moderation reports (requires admin secret)
     if (pathname === '/api/admin/reports' && method === 'GET') {
-      const adminSecretHeader = request.headers.get('x-admin-secret') || '';
-      const isAuthorized =
-        (env.ADMIN_SECRET && constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) ||
-        ((isDevelopment || isTest) && !env.ADMIN_SECRET);
-
-      if (!isAuthorized) {
-        return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+      const adminSecretHeader = request.headers.get('x-admin-secret');
+      if (!adminSecretHeader) {
+        if (!((isDevelopment || isTest) && !env.ADMIN_SECRET)) {
+          return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+        }
+      } else if (!env.ADMIN_SECRET || !constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) {
+        return jsonResponse({ error: 'Forbidden: Invalid admin secret' }, 403);
       }
 
       const statusParam = url.searchParams.get('status') || '';
@@ -1822,13 +1822,13 @@ export default {
 
     // PATCH /api/admin/reports/:id - Set report status (reviewed or dismissed)
     if (pathname.startsWith('/api/admin/reports/') && method === 'PATCH') {
-      const adminSecretHeader = request.headers.get('x-admin-secret') || '';
-      const isAuthorized =
-        (env.ADMIN_SECRET && constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) ||
-        ((isDevelopment || isTest) && !env.ADMIN_SECRET);
-
-      if (!isAuthorized) {
-        return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+      const adminSecretHeader = request.headers.get('x-admin-secret');
+      if (!adminSecretHeader) {
+        if (!((isDevelopment || isTest) && !env.ADMIN_SECRET)) {
+          return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+        }
+      } else if (!env.ADMIN_SECRET || !constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) {
+        return jsonResponse({ error: 'Forbidden: Invalid admin secret' }, 403);
       }
 
       const reportId = pathname.slice('/api/admin/reports/'.length);
@@ -2076,15 +2076,17 @@ export default {
 
     // POST /api/jobs/cleanup-expired - Trigger post lifecycle expiry job
     if (pathname === '/api/jobs/cleanup-expired' && method === 'POST') {
-      const adminSecretHeader = request.headers.get('x-admin-secret') || '';
-      const isAuthorizedAdmin =
-        (env.ADMIN_SECRET && constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) ||
-        ((isDevelopment || isTest) && !env.ADMIN_SECRET);
-
-      // In development or with admin secret, or in test mode
+      const adminSecretHeader = request.headers.get('x-admin-secret');
       const isDevOrTest = isDevelopment || isTest;
-      if (!isDevOrTest && !isAuthorizedAdmin) {
-        return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+      if (!isDevOrTest) {
+        if (!adminSecretHeader) {
+          return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+        }
+        if (!env.ADMIN_SECRET || !constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) {
+          return jsonResponse({ error: 'Forbidden: Invalid admin secret' }, 403);
+        }
+      } else if (env.ADMIN_SECRET && adminSecretHeader && !constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) {
+        return jsonResponse({ error: 'Forbidden: Invalid admin secret' }, 403);
       }
 
       // FIX #1: Remove the reference_time parameter outside tests; the daily cron uses the real clock
