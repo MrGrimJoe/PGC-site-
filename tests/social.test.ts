@@ -174,7 +174,7 @@ describe('Milestone 2 Social Feed, Media, Interactions & Expiry Lifecycle', () =
       const uploadReq = new Request('http://localhost:3000/api/media/uploads', {
         method: 'POST',
         headers: { 'Content-Type': 'image/png', Cookie: aliceSessionCookie },
-        body: new Uint8Array([1, 2, 3, 4]),
+        body: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), // Valid PNG header
       });
       const uploadRes = await worker.fetch(uploadReq, env);
       const media = (await uploadRes.json()) as { id: string; object_key: string };

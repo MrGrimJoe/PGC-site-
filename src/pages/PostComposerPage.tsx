@@ -137,12 +137,24 @@ export const PostComposerPage: React.FC<PostComposerPageProps> = ({ onPostCreate
             rows={5}
             value={body}
             onChange={(e) => setBody(e.target.value)}
-            placeholder="Share thoughts, news, or questions..."
+            placeholder="Share thoughts, news, or questions... Use #hashtags to categorize for discovery."
             maxLength={1000}
             required
             className="w-full bg-surface border border-border rounded-sm p-3 text-[14px] text-text focus:border-primary resize-none transition-colors"
           />
         </div>
+
+        {/* Detected Topics & Hashtags */}
+        {body.includes('#') && (
+          <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+            <span className="text-[12px] text-text-muted font-medium">Tags:</span>
+            {Array.from(new Set(body.match(/#([a-zA-Z0-9_]{1,30})/g) || [])).slice(0, 5).map((tag) => (
+              <span key={tag} className="text-[12px] font-medium px-2 py-0.5 rounded-pill bg-primary-tint text-primary font-mono">
+                {tag}
+              </span>
+            ))}
+          </div>
+        )}
 
         {/* Media Attachments Preview */}
         {mediaList.length > 0 && (

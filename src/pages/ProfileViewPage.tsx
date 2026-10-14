@@ -57,14 +57,14 @@ export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({
   };
 
   const handleToggleFollow = async () => {
-    if (!profile || !profile.id) return;
+    if (!profile || !profile.username) return;
     setTogglingFollow(true);
 
     const isCurrentlyFollowing = !!profile.is_following;
     const method = isCurrentlyFollowing ? 'DELETE' : 'POST';
 
     try {
-      const res = await fetch(`/api/users/${profile.id}/follow`, { method });
+      const res = await fetch(`/api/users/${encodeURIComponent(profile.username)}/follow`, { method });
       if (res.ok) {
         setProfile((prev) =>
           prev
@@ -86,7 +86,7 @@ export const ProfileViewPage: React.FC<ProfileViewPageProps> = ({
     }
   };
 
-  const isSelf = profile?.id === currentUserId;
+  const isSelf = profile?.username === currentUserId;
 
   return (
     <div className="w-full max-w-[640px] mx-auto py-8 px-4 space-y-4">

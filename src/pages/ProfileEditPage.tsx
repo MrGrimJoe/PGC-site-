@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
-import type { MeResponse } from '../../shared/schema.ts';
+import React, { useState, useEffect } from 'react';
+import type { MeResponse, ClassRow, UserInterestTopic } from '../../shared/schema.ts';
 import { normalizeUsername, isValidUsername } from '../../shared/username.ts';
 import { updateProfileSchema } from '../../shared/schema.ts';
-import { Save, Trash2, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { Save, Trash2, AlertTriangle, CheckCircle2, RotateCcw } from 'lucide-react';
 
 interface ProfileEditPageProps {
   currentUser: MeResponse;
@@ -20,7 +20,12 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
   const [username, setUsername] = useState(currentUser.profile.username);
   const [displayName, setDisplayName] = useState(currentUser.profile.display_name);
   const [bio, setBio] = useState(currentUser.profile.bio || '');
+  const [classId, setClassId] = useState(currentUser.profile.class_id || '');
   const [dmPolicy, setDmPolicy] = useState(currentUser.settings.dm_policy || 'everyone');
+
+  const [classes, setClasses] = useState<ClassRow[]>([]);
+  const [interests, setInterests] = useState<UserInterestTopic[]>([]);
+  const [resettingInterests, setResettingInterests] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -29,6 +34,41 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [deleteConfirmationText, setDeleteConfirmationText] = useState('');
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Load campus classes and interests on mount
+  useEffect(() => {
+    fetch('/api/classes')
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = (await res.json()) as { classes?: ClassRow[] };
+        setClasses(data.classes || []);
+      })
+      .catch(() => {});
+
+    fetch('/api/me/interests')
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = (await res.json()) as { interests?: UserInterestTopic[] };
+        setInterests(data.interests || []);
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleResetInterests = async () => {
+    setResettingInterests(true);
+    try {
+      const res = await fetch('/api/me/interests', { method: 'DELETE' });
+      if (res.ok) {
+        setInterests([]);
+        setMessage({ type: 'success', text: 'Interest topics reset successfully.' });
+      }
+    } catch {
+      setMessage({ type: 'error', text: 'Failed to reset interests.' });
+    } finally {
+      setResettingInterests(false);
+    }
+  };
 
   // Real-time username validation
   const normalizedPreview = normalizeUsername(username);
@@ -42,6 +82,7 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
       username: normalizedPreview !== currentUser.profile.username ? normalizedPreview : undefined,
       display_name: displayName,
       bio: bio,
+      class_id: classId || null,
       dm_policy: dmPolicy as 'everyone' | 'following' | 'none',
     };
 
@@ -84,6 +125,7 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
     }
 
     setDeleting(true);
+    setDeleteError(null);
     try {
       const res = await fetch('/api/me', {
         method: 'DELETE',
@@ -96,7 +138,7 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
 
       onAccountDeleted();
     } catch (err) {
-      alert((err as Error).message);
+      setDeleteError((err as Error).message);
       setDeleting(false);
     }
   };
@@ -185,6 +227,27 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
           <p className="text-[12px] text-text-muted">1–50 characters</p>
         </div>
 
+        {/* Campus Class Selection */}
+        <div className="space-y-1">
+          <label htmlFor="select-class" className="block text-[12px] font-semibold text-text">
+            Campus Class Affiliation
+          </label>
+          <select
+            id="select-class"
+            value={classId}
+            onChange={(e) => setClassId(e.target.value)}
+            className="w-full min-h-[44px] bg-surface border border-border rounded-sm px-3 py-2 text-[14px] text-text focus:border-primary transition-colors cursor-pointer"
+          >
+            <option value="">No class selected (General)</option>
+            {classes.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+          <p className="text-[12px] text-text-muted">Used by the discovery engine to surface class cohort posts.</p>
+        </div>
+
         {/* Biography */}
         <div className="space-y-1">
           <div className="flex justify-between items-center">
@@ -232,54 +295,117 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
         </button>
       </form>
 
+      {/* Discovery Interest Profile Card */}
+      <div className="bg-surface border border-border rounded-card p-4 shadow-card space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-[14px] font-semibold text-text">Learned Interest Profile</h2>
+            <p className="text-[12px] text-text-muted">
+              Topics weighted by your likes, comments, and views (14-day decay).
+            </p>
+          </div>
+          {interests.length > 0 && (
+            <button
+              type="button"
+              onClick={handleResetInterests}
+              disabled={resettingInterests}
+              className="text-[12px] font-semibold text-text-muted hover:text-danger flex items-center space-x-1 cursor-pointer"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>{resettingInterests ? 'Resetting...' : 'Reset'}</span>
+            </button>
+          )}
+        </div>
+
+        {interests.length === 0 ? (
+          <p className="text-[13px] text-text-muted py-2 italic">
+            No topic signals recorded yet. Interact with posts to personalize your For You feed.
+          </p>
+        ) : (
+          <div className="flex flex-wrap gap-2 pt-1">
+            {interests.map((it) => (
+              <span
+                key={it.slug}
+                className="text-[12px] px-2.5 py-1 rounded-pill bg-bg border border-border text-text font-medium flex items-center space-x-1.5"
+              >
+                <span>{it.display_name}</span>
+                <span className="text-[10px] font-mono text-primary bg-primary-tint px-1.5 py-0.2 rounded-pill font-semibold">
+                  {it.effective_weight}
+                </span>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* Danger Zone Card */}
       <div className="bg-surface border border-border rounded-card p-4 shadow-card space-y-2">
         <div className="flex items-center space-x-2">
           <span className="w-2 h-2 rounded-pill bg-danger inline-block" />
           <h2 className="text-[14px] font-semibold text-danger">Delete Account</h2>
         </div>
-        <p className="text-[12px] text-text-muted leading-relaxed">
-          Permanently removes your account, profile, settings, and sessions from the database. This action cannot be reversed.
+        <p className="text-[13px] text-text-muted">
+          Permanently delete your profile, posts, media files, and active sessions. This action cannot be reversed.
         </p>
         <button
           type="button"
           onClick={() => setShowDeleteModal(true)}
-          className="min-h-[44px] px-4 rounded-sm border border-danger text-danger bg-surface hover:bg-danger-tint text-[14px] font-semibold flex items-center space-x-2 transition-colors cursor-pointer"
+          className="min-h-[44px] px-3 rounded-sm border border-danger text-danger hover:bg-danger-tint text-[14px] font-semibold transition-colors cursor-pointer"
         >
-          <Trash2 className="w-4 h-4" />
-          <span>Delete Account</span>
+          Delete Account
         </button>
       </div>
 
       {/* Delete Confirmation Modal */}
       {showDeleteModal && (
-        <div className="fixed inset-0 z-50 bg-[#17233A]/40 flex items-center justify-center p-4">
-          <div className="bg-surface border border-border rounded-card p-4 max-w-[420px] w-full space-y-4 shadow-card">
-            <h3 className="text-[16px] font-semibold text-danger flex items-center space-x-2">
-              <AlertTriangle className="w-5 h-5" />
-              <span>Confirm Account Deletion</span>
-            </h3>
-            <p className="text-[14px] text-text">
-              Type <strong className="font-mono text-text">DELETE</strong> below to confirm permanent removal.
-            </p>
-            <div>
-              <label htmlFor="confirm-delete-input" className="block text-[12px] font-semibold text-text mb-1">
-                Confirmation Text
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 bg-text/40 flex items-center justify-center p-4 backdrop-blur-xs"
+        >
+          <div className="bg-surface border border-border rounded-card p-6 w-full max-w-md shadow-card space-y-4">
+            <div className="flex items-start space-x-3">
+              <div className="w-10 h-10 rounded-sm bg-danger-tint flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5 text-danger" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-[16px] font-semibold text-text">Confirm Account Deletion</h3>
+                <p className="text-[13px] text-text-muted">
+                  Are you absolutely sure? All your posts, uploaded media, comments, and followers will be permanently purged.
+                </p>
+              </div>
+            </div>
+
+            {deleteError && (
+              <div className="p-2 rounded-sm bg-danger-tint text-danger text-[12px] font-medium border border-danger">
+                {deleteError}
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              <label htmlFor="confirm-delete-input" className="block text-[12px] text-text font-semibold">
+                Type <span className="font-mono text-danger">DELETE</span> to confirm
               </label>
               <input
                 id="confirm-delete-input"
                 type="text"
                 value={deleteConfirmationText}
                 onChange={(e) => setDeleteConfirmationText(e.target.value)}
-                placeholder="Type DELETE"
-                className="w-full min-h-[44px] bg-surface border border-border rounded-sm px-3 py-2 text-[14px] font-mono text-text focus:border-danger"
+                className="w-full min-h-[44px] bg-surface border border-border rounded-sm px-3 py-2 text-[14px] font-mono focus:border-danger transition-colors text-text"
+                placeholder="DELETE"
               />
             </div>
-            <div className="flex space-x-2 pt-1">
+
+            <div className="flex justify-end space-x-2 pt-2">
               <button
                 type="button"
-                onClick={() => setShowDeleteModal(false)}
-                className="flex-1 min-h-[44px] px-3 rounded-sm border border-border bg-surface text-text hover:bg-bg text-[14px] font-semibold transition-colors cursor-pointer"
+                onClick={() => {
+                  setShowDeleteModal(false);
+                  setDeleteConfirmationText('');
+                  setDeleteError(null);
+                }}
+                disabled={deleting}
+                className="min-h-[44px] px-4 rounded-sm border border-border bg-surface hover:bg-bg text-text text-[14px] font-semibold cursor-pointer transition-colors"
               >
                 Cancel
               </button>
@@ -287,9 +413,10 @@ export const ProfileEditPage: React.FC<ProfileEditPageProps> = ({
                 type="button"
                 onClick={handleDeleteAccount}
                 disabled={deleteConfirmationText !== 'DELETE' || deleting}
-                className="flex-1 min-h-[44px] px-3 rounded-sm bg-danger hover:opacity-90 disabled:opacity-40 text-on-primary text-[14px] font-semibold transition-colors cursor-pointer"
+                className="min-h-[44px] px-4 rounded-sm bg-danger hover:bg-danger text-on-primary text-[14px] font-semibold disabled:opacity-40 flex items-center space-x-1.5 cursor-pointer transition-colors"
               >
-                {deleting ? 'Deleting...' : 'Confirm Delete'}
+                <Trash2 className="w-4 h-4" />
+                <span>{deleting ? 'Deleting...' : 'Delete Forever'}</span>
               </button>
             </div>
           </div>

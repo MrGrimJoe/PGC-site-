@@ -1,5 +1,13 @@
-import type { ExecutionContext, D1PreparedStatement, ScheduledController } from '@cloudflare/workers-types';
-import type { Env, ProfileRow, UserRow, UserSettingsRow, PostRow, MediaRow } from './types.ts';
+import type { ExecutionContext, D1PreparedStatement, ScheduledController, D1Database } from '@cloudflare/workers-types';
+import type {
+  Env,
+  ProfileRow,
+  UserRow,
+  UserSettingsRow,
+  PostRow,
+  MediaRow,
+  ClassRow,
+} from './types.ts';
 import {
   authenticateRequest,
   decodeOAuthState,
@@ -16,12 +24,20 @@ import {
   createPostSchema,
   createCommentSchema,
   createReportSchema,
+  createFeedbackSchema,
+  updateReportSchema,
   type PostItem,
   type CommentItem,
   type MediaItem,
+  type TopicItem,
+  type UserInterestTopic,
+  type TrendItem,
 } from '../shared/schema.ts';
 import { checkRateLimit } from './rate-limit.ts';
 import { runPostLifecycleExpiry, deletePostAndMedia } from './jobs/expiry.ts';
+import { extractTopicsFromText } from './content/topics.ts';
+import { rankPosts, type CandidatePost, type UserRankingContext } from './ranking/engine.ts';
+import { computeDecayedWeight } from './ranking/decay.ts';
 
 function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(data), {
@@ -31,6 +47,48 @@ function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): R
       ...headers,
     },
   });
+}
+
+/**
+ * Constant-time string comparison for secrets to prevent timing attacks.
+ */
+function constantTimeCompare(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const aBuf = new TextEncoder().encode(a);
+  const bBuf = new TextEncoder().encode(b);
+  if (aBuf.byteLength !== bBuf.byteLength) return false;
+  let diff = 0;
+  for (let i = 0; i < aBuf.byteLength; i++) {
+    diff |= aBuf[i]! ^ bBuf[i]!;
+  }
+  return diff === 0;
+}
+
+/**
+ * Encodes composite cursor for (created_at, id) pairs.
+ */
+function encodeCursor(createdAt: string, id: string): string {
+  return Buffer.from(`${createdAt}|${id}`).toString('base64url');
+}
+
+/**
+ * Decodes composite cursor. Supports base64url composite or raw ISO string fallback.
+ */
+function decodeCursor(cursorStr: string): { createdAt: string; id: string } | null {
+  try {
+    const raw = Buffer.from(cursorStr, 'base64url').toString('utf-8');
+    if (raw.includes('|')) {
+      const [createdAt, id] = raw.split('|');
+      if (createdAt && id) return { createdAt, id };
+    }
+  } catch {
+    // Fall back to direct string check
+  }
+
+  if (cursorStr.includes('T') && cursorStr.includes('Z')) {
+    return { createdAt: cursorStr, id: '' };
+  }
+  return null;
 }
 
 function generateRandomUsername(): string {
@@ -44,6 +102,164 @@ function generateRandomUsername(): string {
   return `user_${suffix}`;
 }
 
+/**
+ * Batch-hydrates posts to completely prevent N+1 queries.
+ * Fetches media, like counts, "liked by me", comment counts, and topics in single batched queries.
+ */
+async function hydratePosts(
+  db: D1Database,
+  rows: Array<
+    PostRow & {
+      author_username: string;
+      author_display_name: string;
+      author_avatar_media_id: string | null;
+      author_class_name?: string | null;
+    }
+  >,
+  currentUserId: string
+): Promise<PostItem[]> {
+  if (rows.length === 0) return [];
+  const postIds = rows.map((r) => r.id);
+  const placeholders = postIds.map(() => '?').join(',');
+
+  // 1. Batched media query
+  const mediaRows = await db
+    .prepare(
+      `SELECT pm.post_id, m.id, m.object_key, m.mime_type, m.size_bytes
+       FROM post_media pm
+       JOIN media m ON m.id = pm.media_id
+       WHERE pm.post_id IN (${placeholders})`
+    )
+    .bind(...postIds)
+    .all<{ post_id: string; id: string; object_key: string; mime_type: string; size_bytes: number }>();
+
+  const mediaMap = new Map<string, MediaItem[]>();
+  for (const m of mediaRows.results || []) {
+    const list = mediaMap.get(m.post_id) || [];
+    list.push({
+      id: m.id,
+      object_key: m.object_key,
+      mime_type: m.mime_type,
+      size_bytes: m.size_bytes,
+    });
+    mediaMap.set(m.post_id, list);
+  }
+
+  // 2. Batched like counts
+  const likeCountsRows = await db
+    .prepare(
+      `SELECT post_id, COUNT(*) as count
+       FROM post_reactions
+       WHERE type = 'like' AND post_id IN (${placeholders})
+       GROUP BY post_id`
+    )
+    .bind(...postIds)
+    .all<{ post_id: string; count: number }>();
+
+  const likeCountMap = new Map<string, number>();
+  for (const lc of likeCountsRows.results || []) {
+    likeCountMap.set(lc.post_id, Number(lc.count));
+  }
+
+  // 3. Batched "liked by me"
+  const hasLikedRows = await db
+    .prepare(
+      `SELECT post_id
+       FROM post_reactions
+       WHERE type = 'like' AND user_id = ? AND post_id IN (${placeholders})`
+    )
+    .bind(currentUserId, ...postIds)
+    .all<{ post_id: string }>();
+
+  const likedSet = new Set((hasLikedRows.results || []).map((r) => r.post_id));
+
+  // 4. Batched comment counts
+  const commentCountsRows = await db
+    .prepare(
+      `SELECT post_id, COUNT(*) as count
+       FROM comments
+       WHERE post_id IN (${placeholders})
+       GROUP BY post_id`
+    )
+    .bind(...postIds)
+    .all<{ post_id: string; count: number }>();
+
+  const commentCountMap = new Map<string, number>();
+  for (const cc of commentCountsRows.results || []) {
+    commentCountMap.set(cc.post_id, Number(cc.count));
+  }
+
+  // 5. Batched topics
+  const topicRows = await db
+    .prepare(
+      `SELECT pt.post_id, t.id, t.slug, t.display_name, pt.confidence
+       FROM post_topics pt
+       JOIN topics t ON t.id = pt.topic_id
+       WHERE pt.post_id IN (${placeholders})`
+    )
+    .bind(...postIds)
+    .all<{ post_id: string; id: string; slug: string; display_name: string; confidence: number }>();
+
+  const topicMap = new Map<string, TopicItem[]>();
+  for (const t of topicRows.results || []) {
+    const list = topicMap.get(t.post_id) || [];
+    list.push({
+      id: t.id,
+      slug: t.slug,
+      display_name: t.display_name,
+      confidence: t.confidence,
+    });
+    topicMap.set(t.post_id, list);
+  }
+
+  return rows.map((p) => ({
+    id: p.id,
+    author_id: p.author_id,
+    author_username: p.author_username,
+    author_display_name: p.author_display_name,
+    author_avatar_media_id: p.author_avatar_media_id,
+    author_class_name: p.author_class_name || null,
+    body: p.body,
+    created_at: p.created_at,
+    expires_at: p.expires_at,
+    status: p.status,
+    media: mediaMap.get(p.id) || [],
+    topics: topicMap.get(p.id) || [],
+    likes_count: likeCountMap.get(p.id) || 0,
+    has_liked: likedSet.has(p.id),
+    comments_count: commentCountMap.get(p.id) || 0,
+  }));
+}
+
+/**
+ * Updates user topic signals for all topics attached to a post.
+ */
+async function updateUserTopicSignalsForPost(
+  db: D1Database,
+  userId: string,
+  postId: string,
+  delta: number
+): Promise<void> {
+  const postTopics = await db
+    .prepare('SELECT topic_id FROM post_topics WHERE post_id = ?')
+    .bind(postId)
+    .all<{ topic_id: string }>();
+
+  const now = new Date().toISOString();
+  for (const pt of postTopics.results || []) {
+    await db
+      .prepare(
+        `INSERT INTO user_topic_signals (user_id, topic_id, weight, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, topic_id) DO UPDATE SET
+           weight = user_topic_signals.weight + excluded.weight,
+           updated_at = excluded.updated_at`
+      )
+      .bind(userId, pt.topic_id, delta, now)
+      .run();
+  }
+}
+
 export default {
   // Cloudflare Scheduled Cron Trigger handler for daily post expiry job
   async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
@@ -55,20 +271,21 @@ export default {
     const pathname = url.pathname;
     const method = request.method.toUpperCase();
     const isDevelopment = env.ENVIRONMENT === 'development';
+    const isTest = env.ENVIRONMENT === 'test';
     const isHttps = url.protocol === 'https:' || request.headers.get('x-forwarded-proto') === 'https';
 
     // DEV-ONLY: remove before launch
-    // In development:
-    // - On HTTPS (e.g. AI Studio preview in an iframe), use SameSite=None; Secure; Partitioned so cookies work in third-party contexts.
-    // - On HTTP (e.g. http://localhost), use SameSite=Lax without Secure so Safari doesn't drop unencrypted cookies.
+    // In development / test:
+    // - On HTTPS (AI Studio preview iframe), use SameSite=None; Secure; Partitioned
+    // - On HTTP (localhost), use SameSite=Lax without Secure so Safari doesn't drop cookies
     // In production:
-    // - Always enforce Secure; HttpOnly; SameSite=Lax.
-    const cookieSecure = isDevelopment ? isHttps : true;
-    const cookieSameSite = isDevelopment && isHttps ? ('None' as const) : ('Lax' as const);
-    const cookiePartitioned = isDevelopment && isHttps;
+    // - Always enforce Secure; HttpOnly; SameSite=Lax
+    const cookieSecure = (isDevelopment || isTest) ? isHttps : true;
+    const cookieSameSite = (isDevelopment || isTest) && isHttps ? ('None' as const) : ('Lax' as const);
+    const cookiePartitioned = (isDevelopment || isTest) && isHttps;
 
     // CLEANUP #1: Revert oauth_state cookie to Path=/api/auth/callback outside development
-    const oauthCookiePath = isDevelopment ? '/' : '/api/auth/callback';
+    const oauthCookiePath = (isDevelopment || isTest) ? '/' : '/api/auth/callback';
 
     // CORS / preflight
     if (method === 'OPTIONS') {
@@ -77,7 +294,7 @@ export default {
         headers: {
           'Access-Control-Allow-Origin': env.APP_URL || url.origin,
           'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Cookie',
+          'Access-Control-Allow-Headers': 'Content-Type, Cookie, X-Admin-Secret',
           'Access-Control-Allow-Credentials': 'true',
         },
       });
@@ -93,46 +310,64 @@ export default {
       const isMockRequested =
         url.searchParams.get('mock') === 'true' || env.GOOGLE_CLIENT_ID === 'PLACEHOLDER';
 
-      if (isMockRequested && !isDevelopment) {
+      if (isMockRequested && !isDevelopment && !isTest) {
         return jsonResponse({ error: 'Mock authentication is disabled in production' }, 400);
       }
 
       const state = generateRandomString(24);
-      const nonce = generateRandomString(24);
       const codeVerifier = generateRandomString(32);
+      const nonce = generateRandomString(24);
       const codeChallenge = await generateCodeChallenge(codeVerifier);
 
       const redirectUri = `${env.APP_URL || url.origin}/api/auth/callback`;
 
-      const oauthState = encodeOAuthState({
+      const statePayload = {
         state,
         codeVerifier,
         nonce,
         createdAt: Date.now(),
-      });
+      };
 
-      const googleAuthUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-      googleAuthUrl.searchParams.set('client_id', env.GOOGLE_CLIENT_ID);
-      googleAuthUrl.searchParams.set('redirect_uri', redirectUri);
-      googleAuthUrl.searchParams.set('response_type', 'code');
-      googleAuthUrl.searchParams.set('scope', 'openid email profile');
-      googleAuthUrl.searchParams.set('state', state);
-      googleAuthUrl.searchParams.set('nonce', nonce);
-      googleAuthUrl.searchParams.set('code_challenge', codeChallenge);
-      googleAuthUrl.searchParams.set('code_challenge_method', 'S256');
-      googleAuthUrl.searchParams.set('prompt', 'select_account');
+      const encodedStateCookie = encodeOAuthState(statePayload);
 
-      // DEV-ONLY: remove before launch
-      const targetUrl =
-        isMockRequested && isDevelopment
+      if (isMockRequested) {
+        const mockRedirect = (isDevelopment || isTest)
           ? `/api/auth/callback?code=mock_code&state=${encodeURIComponent(state)}&mock=true`
-          : googleAuthUrl.toString();
+          : `${redirectUri}?code=mock_code&state=${encodeURIComponent(state)}&mock=true`;
+
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: mockRedirect,
+            'Set-Cookie': serializeCookie('oauth_state', encodedStateCookie, {
+              path: oauthCookiePath,
+              maxAge: 600,
+              httpOnly: true,
+              secure: cookieSecure,
+              sameSite: cookieSameSite,
+              partitioned: cookiePartitioned,
+            }),
+          },
+        });
+      }
+
+      const params = new URLSearchParams({
+        client_id: env.GOOGLE_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'openid email profile',
+        state,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256',
+        nonce,
+        prompt: 'select_account',
+      });
 
       return new Response(null, {
         status: 302,
         headers: {
-          Location: targetUrl,
-          'Set-Cookie': serializeCookie('oauth_state', oauthState, {
+          Location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
+          'Set-Cookie': serializeCookie('oauth_state', encodedStateCookie, {
             path: oauthCookiePath,
             maxAge: 600,
             httpOnly: true,
@@ -147,189 +382,167 @@ export default {
     // GET /api/auth/callback - Handle OAuth callback
     if (pathname === '/api/auth/callback' && method === 'GET') {
       const code = url.searchParams.get('code');
-      const stateParam = url.searchParams.get('state');
+      const state = url.searchParams.get('state');
       const errorParam = url.searchParams.get('error');
+      const isMock = url.searchParams.get('mock') === 'true';
 
       if (errorParam) {
-        return jsonResponse({ error: 'Authentication failed' }, 400);
+        return jsonResponse({ error: 'Authentication was denied or encountered an error' }, 400);
       }
 
-      // DEV-ONLY: remove before launch
-      const isMockCode = url.searchParams.get('mock') === 'true' || (code ? code.startsWith('mock_') : false);
+      if (!code || !state) {
+        return jsonResponse({ error: 'Missing code or state in OAuth callback' }, 400);
+      }
 
-      if (isMockCode && !isDevelopment) {
+      if (isMock && !isDevelopment && !isTest) {
         return jsonResponse({ error: 'Mock authorization is disabled in production' }, 400);
       }
 
       const cookies = parseCookies(request.headers.get('Cookie'));
-      const rawOAuthCookie = cookies['oauth_state'];
-
-      let oauthState = rawOAuthCookie ? decodeOAuthState(rawOAuthCookie) : null;
-
-      // DEV-ONLY: remove before launch
-      if (!oauthState && isDevelopment && isMockCode) {
-        oauthState = {
-          state: stateParam || 'mock_state',
-          codeVerifier: 'mock_verifier',
-          nonce: stateParam || 'mock_nonce',
-          createdAt: Date.now(),
-        };
-      }
-
-      if (!rawOAuthCookie && (!isDevelopment || !isMockCode)) {
+      const rawStateCookie = cookies['oauth_state'];
+      if (!rawStateCookie && (!isMock || (!isDevelopment && !isTest))) {
         return jsonResponse({ error: 'Missing OAuth state cookie' }, 400);
       }
 
-      if (!oauthState) {
-        return jsonResponse({ error: 'Invalid or expired OAuth state cookie' }, 400);
+      const oauthState = rawStateCookie ? decodeOAuthState(rawStateCookie) : null;
+      if (!oauthState && (!isMock || (!isDevelopment && !isTest))) {
+        return jsonResponse({ error: 'Invalid or corrupt OAuth state' }, 400);
       }
 
-      if (!stateParam || stateParam !== oauthState.state) {
-        return jsonResponse({ error: 'Invalid OAuth state parameter' }, 400);
+      if (oauthState) {
+        if (Date.now() - oauthState.createdAt > 10 * 60 * 1000) {
+          return jsonResponse({ error: 'OAuth session expired. Please sign in again.' }, 400);
+        }
+
+        if (oauthState.state !== state) {
+          return jsonResponse({ error: 'Invalid OAuth state parameter' }, 400);
+        }
       }
 
-      if (!code) {
-        return jsonResponse({ error: 'Missing authorization code' }, 400);
-      }
+      let providerSubject: string;
+      let displayName: string;
 
-      const redirectUri = `${env.APP_URL || url.origin}/api/auth/callback`;
-      let providerSubject = '';
-
-      // DEV-ONLY: remove before launch
-      if (isMockCode) {
-        providerSubject = `google_mock_sub_${oauthState.nonce.slice(0, 12)}`;
+      if (isMock) {
+        providerSubject = 'mock-google-sub-12345';
+        displayName = 'Test User';
       } else {
-        let tokenResponse: globalThis.Response;
-        try {
-          tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            body: new URLSearchParams({
-              client_id: env.GOOGLE_CLIENT_ID,
-              client_secret: env.GOOGLE_CLIENT_SECRET,
-              code,
-              code_verifier: oauthState.codeVerifier,
-              grant_type: 'authorization_code',
-              redirect_uri: redirectUri,
-            }),
-          });
-        } catch {
-          return jsonResponse({ error: 'Authentication failed' }, 400);
+        const redirectUri = `${env.APP_URL || url.origin}/api/auth/callback`;
+
+        const tokenParams = new URLSearchParams({
+          client_id: env.GOOGLE_CLIENT_ID,
+          client_secret: env.GOOGLE_CLIENT_SECRET,
+          code,
+          grant_type: 'authorization_code',
+          redirect_uri: redirectUri,
+          code_verifier: oauthState?.codeVerifier || '',
+        });
+
+        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: tokenParams.toString(),
+        });
+
+        if (!tokenRes.ok) {
+          return jsonResponse({ error: 'Failed to authenticate with Google' }, 400);
         }
 
-        if (!tokenResponse.ok) {
-          return jsonResponse({ error: 'Authentication failed' }, 400);
-        }
-
-        const tokenData = (await tokenResponse.json()) as { id_token?: string; access_token?: string };
+        const tokenData = (await tokenRes.json()) as { id_token?: string };
         if (!tokenData.id_token) {
-          return jsonResponse({ error: 'Authentication failed' }, 400);
+          return jsonResponse({ error: 'Missing ID token from Google response' }, 400);
         }
 
         try {
-          const idTokenPayload = await verifyGoogleIdToken(
-            tokenData.id_token,
-            env.GOOGLE_CLIENT_ID,
-            oauthState.nonce
-          );
-          providerSubject = idTokenPayload.sub;
+          const claims = await verifyGoogleIdToken(tokenData.id_token, env.GOOGLE_CLIENT_ID, oauthState?.nonce || '');
+          providerSubject = claims.sub;
+          displayName = claims.name || claims.email?.split('@')[0] || 'Dialtone User';
         } catch {
-          return jsonResponse({ error: 'Authentication failed' }, 400);
+          return jsonResponse({ error: 'Failed to verify Google identity token' }, 400);
         }
       }
 
-      // Check if user already exists
-      const existingUser = await env.DB.prepare('SELECT * FROM users WHERE provider_subject = ?')
+      let user = await env.DB.prepare('SELECT id, created_at, status FROM users WHERE provider_subject = ?')
         .bind(providerSubject)
         .first<UserRow>();
 
       const now = new Date().toISOString();
-      const sessionId = `sess_${generateRandomString(32).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
-      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
-      if (!existingUser) {
-        // Usernames for new accounts are random (user_ + 6 random chars), never derived from email
+      if (!user) {
         const userId = `usr_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+        const randomUsername = generateRandomUsername();
 
-        let finalUsername = generateRandomUsername();
-        while (true) {
-          const existing = await env.DB.prepare(
-            'SELECT user_id FROM profiles WHERE username_normalized = ?'
-          )
-            .bind(normalizeUsername(finalUsername))
-            .first();
-          if (!existing) break;
-          finalUsername = generateRandomUsername();
-        }
+        const signupStatements: D1PreparedStatement[] = [
+          env.DB.prepare('INSERT INTO users (id, provider_subject, created_at, status) VALUES (?, ?, ?, ?)').bind(
+            userId,
+            providerSubject,
+            now,
+            'active'
+          ),
+          env.DB.prepare(
+            'INSERT INTO profiles (user_id, username, username_normalized, display_name, bio) VALUES (?, ?, ?, ?, ?)'
+          ).bind(userId, randomUsername, normalizeUsername(randomUsername), displayName, ''),
+          env.DB.prepare('INSERT INTO user_settings (user_id) VALUES (?)').bind(userId),
+        ];
 
-        const normalizedUsername = normalizeUsername(finalUsername);
-        const displayName = finalUsername;
-
-        // D1 batch for signup: users, profiles, user_settings, sessions
         try {
-          await env.DB.batch([
-            env.DB.prepare(
-              'INSERT INTO users (id, provider_subject, created_at, status) VALUES (?, ?, ?, ?)'
-            ).bind(userId, providerSubject, now, 'active'),
-            env.DB.prepare(
-              'INSERT INTO profiles (user_id, username, username_normalized, display_name, bio, avatar_media_id) VALUES (?, ?, ?, ?, ?, ?)'
-            ).bind(userId, finalUsername, normalizedUsername, displayName, '', null),
-            env.DB.prepare(
-              'INSERT INTO user_settings (user_id, dm_policy, feed_preferences) VALUES (?, ?, ?)'
-            ).bind(userId, 'everyone', '{}'),
-            env.DB.prepare(
-              'INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)'
-            ).bind(sessionId, userId, expiresAt),
-          ]);
+          await env.DB.batch(signupStatements);
         } catch (dbErr) {
           const errMsg = (dbErr as Error).message || '';
           if (errMsg.includes('UNIQUE constraint') && errMsg.includes('username')) {
-            return jsonResponse({ error: 'Username is already taken' }, 409);
+            const retryUsername = generateRandomUsername();
+            await env.DB.batch([
+              signupStatements[0]!,
+              env.DB.prepare(
+                'INSERT INTO profiles (user_id, username, username_normalized, display_name, bio) VALUES (?, ?, ?, ?, ?)'
+              ).bind(userId, retryUsername, normalizeUsername(retryUsername), displayName, ''),
+              signupStatements[2]!,
+            ]);
+          } else {
+            return jsonResponse({ error: 'Failed to create user account' }, 500);
           }
-          return jsonResponse({ error: 'Failed to create user account' }, 500);
-        }
-      } else {
-        if (existingUser.status !== 'active') {
-          return jsonResponse({ error: 'User account is inactive' }, 403);
         }
 
-        await env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
-          .bind(sessionId, existingUser.id, expiresAt)
-          .run();
+        user = {
+          id: userId,
+          provider_subject: providerSubject,
+          created_at: now,
+          status: 'active',
+        };
       }
 
-      const headers = new Headers();
-      // DEV-ONLY: remove before launch
-      const postLoginLocation = isDevelopment ? '/' : `${env.APP_URL}/`;
-      headers.set('Location', postLoginLocation);
-      headers.append(
-        'Set-Cookie',
-        serializeCookie('session_id', sessionId, {
-          path: '/',
-          maxAge: 30 * 24 * 60 * 60,
-          httpOnly: true,
-          secure: cookieSecure,
-          sameSite: cookieSameSite,
-          partitioned: cookiePartitioned,
-        })
-      );
-      headers.append(
-        'Set-Cookie',
-        serializeCookie('oauth_state', '', {
-          path: oauthCookiePath,
-          maxAge: 0,
-          httpOnly: true,
-          secure: cookieSecure,
-          sameSite: cookieSameSite,
-          partitioned: cookiePartitioned,
-        })
-      );
+      const sessionId = `sess_${generateRandomString(32)}`;
+      const sessionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      await env.DB.prepare('INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)')
+        .bind(sessionId, user.id, sessionExpiry)
+        .run();
+
+      const clearOauthStateCookie = serializeCookie('oauth_state', '', {
+        path: oauthCookiePath,
+        maxAge: 0,
+        httpOnly: true,
+        secure: cookieSecure,
+        sameSite: cookieSameSite,
+        partitioned: cookiePartitioned,
+      });
+
+      const sessionCookie = serializeCookie('session_id', sessionId, {
+        path: '/',
+        maxAge: 30 * 24 * 60 * 60,
+        httpOnly: true,
+        secure: cookieSecure,
+        sameSite: cookieSameSite,
+        partitioned: cookiePartitioned,
+      });
+
+      const responseHeaders = new Headers();
+      responseHeaders.append('Set-Cookie', sessionCookie);
+      responseHeaders.append('Set-Cookie', clearOauthStateCookie);
+      responseHeaders.set('Location', '/');
 
       return new Response(null, {
         status: 302,
-        headers,
+        headers: responseHeaders,
       });
     }
 
@@ -342,19 +555,19 @@ export default {
         await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(sessionId).run();
       }
 
+      const clearSessionCookie = serializeCookie('session_id', '', {
+        path: '/',
+        maxAge: 0,
+        httpOnly: true,
+        secure: cookieSecure,
+        sameSite: cookieSameSite,
+        partitioned: cookiePartitioned,
+      });
+
       return jsonResponse(
         { success: true, message: 'Logged out successfully' },
         200,
-        {
-          'Set-Cookie': serializeCookie('session_id', '', {
-            path: '/',
-            maxAge: 0,
-            httpOnly: true,
-            secure: cookieSecure,
-            sameSite: cookieSameSite,
-            partitioned: cookiePartitioned,
-          }),
-        }
+        { 'Set-Cookie': clearSessionCookie }
       );
     }
 
@@ -377,9 +590,11 @@ export default {
       const normalized = normalizeUsername(usernameParam);
 
       const row = await env.DB.prepare(
-        `SELECT p.user_id, p.username, p.display_name, p.bio, p.avatar_media_id, u.created_at
+        `SELECT p.user_id, p.username, p.display_name, p.bio, p.avatar_media_id, p.class_id,
+                c.name AS class_name, u.created_at
          FROM profiles p
          JOIN users u ON u.id = p.user_id
+         LEFT JOIN classes c ON c.id = p.class_id
          WHERE p.username_normalized = ? AND u.status = 'active'`
       )
         .bind(normalized)
@@ -389,6 +604,8 @@ export default {
           display_name: string;
           bio: string;
           avatar_media_id: string | null;
+          class_id: string | null;
+          class_name: string | null;
           created_at: string;
         }>();
 
@@ -396,7 +613,6 @@ export default {
         return jsonResponse({ error: 'User not found' }, 404);
       }
 
-      // Check if current user follows this user
       const isFollowing = await env.DB.prepare(
         'SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?'
       )
@@ -420,6 +636,8 @@ export default {
         display_name: row.display_name,
         bio: row.bio,
         avatar_media_id: row.avatar_media_id,
+        class_id: row.class_id,
+        class_name: row.class_name,
         created_at: row.created_at,
         is_following: !!isFollowing,
         followers_count: Number(followersCount?.count || 0),
@@ -434,6 +652,10 @@ export default {
         return jsonResponse({ error: 'Unauthorized' }, 401);
       }
 
+      const classRow = auth.profile.class_id
+        ? await env.DB.prepare('SELECT name FROM classes WHERE id = ?').bind(auth.profile.class_id).first<{ name: string }>()
+        : null;
+
       return jsonResponse({
         user: {
           id: auth.user.id,
@@ -446,6 +668,8 @@ export default {
           display_name: auth.profile.display_name,
           bio: auth.profile.bio,
           avatar_media_id: auth.profile.avatar_media_id,
+          class_id: auth.profile.class_id || null,
+          class_name: classRow?.name || null,
         },
         settings: {
           dm_policy: auth.settings.dm_policy,
@@ -501,7 +725,8 @@ export default {
         data.username !== undefined ||
         data.display_name !== undefined ||
         data.bio !== undefined ||
-        data.avatar_media_id !== undefined
+        data.avatar_media_id !== undefined ||
+        data.class_id !== undefined
       ) {
         const currentProfile = auth.profile;
         const newUsername = data.username !== undefined ? data.username : currentProfile.username;
@@ -511,13 +736,15 @@ export default {
         const newBio = data.bio !== undefined ? data.bio : currentProfile.bio;
         const newAvatar =
           data.avatar_media_id !== undefined ? data.avatar_media_id : currentProfile.avatar_media_id;
+        const newClassId =
+          data.class_id !== undefined ? data.class_id : (currentProfile.class_id || null);
 
         batchStatements.push(
           env.DB.prepare(
             `UPDATE profiles
-             SET username = ?, username_normalized = ?, display_name = ?, bio = ?, avatar_media_id = ?
+             SET username = ?, username_normalized = ?, display_name = ?, bio = ?, avatar_media_id = ?, class_id = ?
              WHERE user_id = ?`
-          ).bind(newUsername, newNorm, newDisplayName, newBio, newAvatar, auth.user.id)
+          ).bind(newUsername, newNorm, newDisplayName, newBio, newAvatar, newClassId, auth.user.id)
         );
       }
 
@@ -581,7 +808,6 @@ export default {
 
       const userId = auth.user.id;
 
-      // Find all media owned by user to clean up from R2
       const userMedia = await env.DB.prepare('SELECT object_key FROM media WHERE owner_id = ?')
         .bind(userId)
         .all<{ object_key: string }>();
@@ -591,7 +817,7 @@ export default {
           try {
             await env.MEDIA_BUCKET.delete(m.object_key);
           } catch {
-            // Ignore R2 deletion error during account purge
+            // Ignore R2 error on account purge
           }
         }
       }
@@ -620,7 +846,211 @@ export default {
     }
 
     // ==========================================
-    // 3. SOCIAL POSTS, FEED & INTERACTIONS
+    // 3. DISCOVERY METADATA & SIGNALS
+    // ==========================================
+
+    // GET /api/classes - Available campus classes
+    if (pathname === '/api/classes' && method === 'GET') {
+      const classesResult = await env.DB.prepare('SELECT id, name FROM classes ORDER BY name ASC').all<ClassRow>();
+      return jsonResponse({ classes: classesResult.results || [] });
+    }
+
+    // GET /api/trends - Topic trend snapshots
+    if (pathname === '/api/trends' && method === 'GET') {
+      const windowParam = url.searchParams.get('window') === '7d' ? '7d' : '24h';
+      const trends = await env.DB.prepare(
+        `SELECT ts.topic_id, t.slug, t.display_name, ts.window, ts.score
+         FROM trend_snapshots ts
+         JOIN topics t ON t.id = ts.topic_id
+         WHERE ts.window = ?
+         ORDER BY ts.score DESC
+         LIMIT 20`
+      )
+        .bind(windowParam)
+        .all<TrendItem>();
+
+      return jsonResponse({
+        window: windowParam,
+        trends: trends.results || [],
+      });
+    }
+
+    // GET /api/me/interests - User interest topics with 14-day decayed effective weights
+    if (pathname === '/api/me/interests' && method === 'GET') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      const rows = await env.DB.prepare(
+        `SELECT uts.topic_id, t.slug, t.display_name, uts.weight AS raw_weight, uts.updated_at
+         FROM user_topic_signals uts
+         JOIN topics t ON t.id = uts.topic_id
+         WHERE uts.user_id = ?
+         ORDER BY uts.weight DESC`
+      )
+        .bind(auth.user.id)
+        .all<{ topic_id: string; slug: string; display_name: string; raw_weight: number; updated_at: string }>();
+
+      const now = Date.now();
+      const interests: UserInterestTopic[] = (rows.results || []).map((r) => ({
+        topic_id: r.topic_id,
+        slug: r.slug,
+        display_name: r.display_name,
+        raw_weight: r.raw_weight,
+        effective_weight: Number(computeDecayedWeight(r.raw_weight, r.updated_at, now).toFixed(3)),
+        updated_at: r.updated_at,
+      }));
+
+      return jsonResponse({ interests });
+    }
+
+    // DELETE /api/me/interests or POST /api/me/interests/reset - Reset topic signals
+    if (
+      (pathname === '/api/me/interests' && method === 'DELETE') ||
+      (pathname === '/api/me/interests/reset' && method === 'POST')
+    ) {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      await env.DB.prepare('DELETE FROM user_topic_signals WHERE user_id = ?').bind(auth.user.id).run();
+      return jsonResponse({ success: true, message: 'Interests reset successfully' });
+    }
+
+    // POST /api/feedback - Post feedback ('more_like_this', 'show_less', 'not_interested')
+    if (pathname === '/api/feedback' && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const parseResult = createFeedbackSchema.safeParse(body);
+      if (!parseResult.success) {
+        return jsonResponse({ error: 'Validation failed', issues: parseResult.error.issues }, 400);
+      }
+
+      const { post_id, type } = parseResult.data;
+      const feedbackId = `fb_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+      const now = new Date().toISOString();
+
+      await env.DB.prepare(
+        'INSERT INTO feedback (id, user_id, post_id, type, created_at) VALUES (?, ?, ?, ?, ?)'
+      )
+        .bind(feedbackId, auth.user.id, post_id, type, now)
+        .run();
+
+      // Update interest signals based on feedback type:
+      // more_like_this: +3, show_less: -3, not_interested: -4
+      const signalDelta = type === 'more_like_this' ? 3.0 : type === 'show_less' ? -3.0 : -4.0;
+      await updateUserTopicSignalsForPost(env.DB, auth.user.id, post_id, signalDelta);
+
+      return jsonResponse({ success: true, type, post_id }, 201);
+    }
+
+    // POST /api/impressions - Record post impression and view duration
+    if (pathname === '/api/impressions' && method === 'POST') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      let body: { impressions?: Array<{ post_id: string; position?: number; duration_ms?: number }> };
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const impressions = body.impressions || [];
+      const now = new Date().toISOString();
+
+      for (const item of impressions) {
+        if (!item.post_id) continue;
+        const impId = `imp_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+        await env.DB.prepare(
+          'INSERT INTO impressions (id, viewer_id, post_id, shown_at, position) VALUES (?, ?, ?, ?, ?)'
+        )
+          .bind(impId, auth.user.id, item.post_id, now, item.position || 0)
+          .run();
+
+        // View over 3 seconds (+0.1 signal)
+        if (item.duration_ms && item.duration_ms >= 3000) {
+          await updateUserTopicSignalsForPost(env.DB, auth.user.id, item.post_id, 0.1);
+        }
+      }
+
+      return jsonResponse({ success: true, recorded: impressions.length });
+    }
+
+    // GET /api/search - Search posts by query or topic with rate limiting
+    if (pathname === '/api/search' && method === 'GET') {
+      const auth = await authenticateRequest(request, env.DB);
+      if (!auth) {
+        return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      // FIX #3: Rate limit search: max 60 per minute per user
+      const rate = await checkRateLimit(env.DB, `search:${auth.user.id}`, 60, 60 * 1000);
+      if (!rate.allowed) {
+        return jsonResponse(
+          { error: 'Search rate limit exceeded. Please wait a moment.' },
+          429,
+          { 'Retry-After': String(rate.retryAfterSeconds) }
+        );
+      }
+
+      const q = (url.searchParams.get('q') || '').trim();
+      const limit = Math.min(Math.max(1, Number(url.searchParams.get('limit') || 20)), 50);
+
+      if (!q) {
+        return jsonResponse({ posts: [], total: 0 });
+      }
+
+      const nowIso = new Date().toISOString();
+      const searchPattern = `%${q}%`;
+
+      const searchRows = await env.DB.prepare(
+        `SELECT p.id, p.author_id, p.body, p.created_at, p.expires_at, p.status,
+                pr.username AS author_username, pr.display_name AS author_display_name,
+                pr.avatar_media_id AS author_avatar_media_id, c.name AS author_class_name
+         FROM posts p
+         JOIN profiles pr ON pr.user_id = p.author_id
+         LEFT JOIN classes c ON c.id = pr.class_id
+         WHERE p.status = 'active'
+           AND p.expires_at > ?
+           AND (p.body LIKE ? OR p.id IN (
+             SELECT pt.post_id FROM post_topics pt
+             JOIN topics t ON t.id = pt.topic_id
+             WHERE t.slug LIKE ? OR t.display_name LIKE ?
+           ))
+         ORDER BY p.created_at DESC
+         LIMIT ?`
+      )
+        .bind(nowIso, searchPattern, searchPattern, searchPattern, limit)
+        .all<
+          PostRow & {
+            author_username: string;
+            author_display_name: string;
+            author_avatar_media_id: string | null;
+            author_class_name: string | null;
+          }
+        >();
+
+      const hydrated = await hydratePosts(env.DB, searchRows.results || [], auth.user.id);
+      return jsonResponse({ posts: hydrated, total: hydrated.length });
+    }
+
+    // ==========================================
+    // 4. SOCIAL POSTS, FEED & INTERACTIONS
     // ==========================================
 
     // POST /api/posts - Create new post (body max 1000 chars, up to 4 images, 7-day expiry)
@@ -630,8 +1060,8 @@ export default {
         return jsonResponse({ error: 'Unauthorized' }, 401);
       }
 
-      // Rate limit: max 10 posts per hour per user
-      const rate = checkRateLimit(`post:${auth.user.id}`, 10, 60 * 60 * 1000);
+      // FIX #3: D1-backed rate limit: max 10 posts per hour per user
+      const rate = await checkRateLimit(env.DB, `post:${auth.user.id}`, 10, 60 * 60 * 1000);
       if (!rate.allowed) {
         return jsonResponse(
           { error: 'Rate limit exceeded: maximum 10 posts per hour. Please try again later.' },
@@ -677,7 +1107,7 @@ export default {
 
       const nowMs = Date.now();
       const createdAt = new Date(nowMs).toISOString();
-      // New posts get expires_at = created_at + 7 days
+      // New posts get expires_at = created_at + 7 days (bound ISO timestamp)
       const expiresAt = new Date(nowMs + 7 * 24 * 60 * 60 * 1000).toISOString();
       const postId = `pst_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
 
@@ -697,6 +1127,29 @@ export default {
 
       await env.DB.batch(statements);
 
+      // Content Understanding: extract hashtags and keyword topics (code-only, no external AI calls)
+      const extractedTopics = extractTopicsFromText(postBody);
+      for (const t of extractedTopics) {
+        const topicId = `top_${t.slug}`;
+        await env.DB.prepare(
+          'INSERT OR IGNORE INTO topics (id, slug, display_name) VALUES (?, ?, ?)'
+        )
+          .bind(topicId, t.slug, t.displayName)
+          .run();
+
+        const realTopic = await env.DB.prepare('SELECT id FROM topics WHERE slug = ?')
+          .bind(t.slug)
+          .first<{ id: string }>();
+
+        if (realTopic) {
+          await env.DB.prepare(
+            'INSERT OR REPLACE INTO post_topics (post_id, topic_id, confidence) VALUES (?, ?, ?)'
+          )
+            .bind(postId, realTopic.id, t.confidence)
+            .run();
+        }
+      }
+
       return jsonResponse(
         {
           id: postId,
@@ -706,83 +1159,59 @@ export default {
           expires_at: expiresAt,
           status: 'active',
           media_ids,
+          topics: extractedTopics,
         },
         201
       );
     }
 
     // GET /api/posts/:id - Retrieve single post with media, likes count, and user like status
-    if (pathname.startsWith('/api/posts/') && !pathname.includes('/likes') && !pathname.includes('/comments') && method === 'GET') {
+    if (
+      pathname.startsWith('/api/posts/') &&
+      !pathname.includes('/likes') &&
+      !pathname.includes('/comments') &&
+      method === 'GET'
+    ) {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
         return jsonResponse({ error: 'Unauthorized' }, 401);
       }
 
       const postId = pathname.slice('/api/posts/'.length);
-      const post = await env.DB.prepare(
+      const postRow = await env.DB.prepare(
         `SELECT p.id, p.author_id, p.body, p.created_at, p.expires_at, p.status,
-                pr.username AS author_username, pr.display_name AS author_display_name, pr.avatar_media_id AS author_avatar_media_id
+                pr.username AS author_username, pr.display_name AS author_display_name,
+                pr.avatar_media_id AS author_avatar_media_id, c.name AS author_class_name
          FROM posts p
          JOIN profiles pr ON pr.user_id = p.author_id
+         LEFT JOIN classes c ON c.id = pr.class_id
          WHERE p.id = ? AND p.status = 'active'`
       )
         .bind(postId)
-        .first<PostRow & { author_username: string; author_display_name: string; author_avatar_media_id: string | null }>();
+        .first<
+          PostRow & {
+            author_username: string;
+            author_display_name: string;
+            author_avatar_media_id: string | null;
+            author_class_name: string | null;
+          }
+        >();
 
-      if (!post) {
+      if (!postRow) {
         return jsonResponse({ error: 'Post not found' }, 404);
       }
 
-      // Fetch linked media
-      const media = await env.DB.prepare(
-        `SELECT m.id, m.object_key, m.mime_type, m.size_bytes
-         FROM media m
-         JOIN post_media pm ON pm.media_id = m.id
-         WHERE pm.post_id = ?`
-      )
-        .bind(postId)
-        .all<MediaItem>();
-
-      // Likes count and user like status
-      const likesCount = await env.DB.prepare(
-        'SELECT COUNT(*) as count FROM post_reactions WHERE post_id = ?'
-      )
-        .bind(postId)
-        .first<{ count: number }>();
-
-      const hasLiked = await env.DB.prepare(
-        'SELECT 1 FROM post_reactions WHERE post_id = ? AND user_id = ?'
-      )
-        .bind(postId, auth.user.id)
-        .first();
-
-      const commentsCount = await env.DB.prepare(
-        'SELECT COUNT(*) as count FROM comments WHERE post_id = ?'
-      )
-        .bind(postId)
-        .first<{ count: number }>();
-
-      const postItem: PostItem = {
-        id: post.id,
-        author_id: post.author_id,
-        author_username: post.author_username,
-        author_display_name: post.author_display_name,
-        author_avatar_media_id: post.author_avatar_media_id,
-        body: post.body,
-        created_at: post.created_at,
-        expires_at: post.expires_at,
-        status: post.status,
-        media: media.results || [],
-        likes_count: Number(likesCount?.count || 0),
-        has_liked: !!hasLiked,
-        comments_count: Number(commentsCount?.count || 0),
-      };
-
-      return jsonResponse(postItem);
+      const hydrated = await hydratePosts(env.DB, [postRow], auth.user.id);
+      return jsonResponse(hydrated[0]);
     }
 
     // DELETE /api/posts/:id - Author only delete
-    if (pathname.startsWith('/api/posts/') && !pathname.includes('/likes') && !pathname.includes('/comments') && method === 'DELETE') {
+    if (
+      pathname.startsWith('/api/posts/') &&
+      !pathname.includes('/likes') &&
+      !pathname.includes('/comments') &&
+      method === 'DELETE'
+    ) {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
         return jsonResponse({ error: 'Unauthorized' }, 401);
@@ -797,103 +1226,201 @@ export default {
         return jsonResponse({ error: 'Post not found' }, 404);
       }
 
-      // Check author ownership
       if (post.author_id !== auth.user.id) {
         return jsonResponse({ error: 'Forbidden: You can only delete your own posts' }, 403);
       }
 
       await deletePostAndMedia(env, postId);
-
-      return jsonResponse({ success: true, message: 'Post deleted successfully' });
+      return jsonResponse({ success: true, message: 'Post and associated media deleted' });
     }
 
-    // GET /api/feed - Chronological feed from followed users plus own posts with cursor pagination
+    // GET /api/feed - Chronological or Discovery Ranked Feed with (created_at, id) cursor pagination
     if (pathname === '/api/feed' && method === 'GET') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
         return jsonResponse({ error: 'Unauthorized' }, 401);
       }
 
-      const cursor = url.searchParams.get('cursor'); // ISO date string of last post's created_at
+      const rawCursor = url.searchParams.get('cursor');
+      const cursorObj = rawCursor ? decodeCursor(rawCursor) : null;
       const limit = Math.min(Math.max(1, Number(url.searchParams.get('limit') || 20)), 50);
+      const mode = url.searchParams.get('mode'); // 'ranked' | 'for_you' | 'following' | 'chronological'
+      const isRankedRequested = mode === 'ranked' || mode === 'for_you';
 
+      // Bound ISO timestamp for expiry comparison (FIX #2)
+      const nowIso = new Date().toISOString();
+
+      if (isRankedRequested) {
+        // Discovery Ranking Engine
+        // 1. Fetch user topic signals
+        const signalRows = await env.DB.prepare(
+          `SELECT t.slug, uts.weight, uts.updated_at
+           FROM user_topic_signals uts
+           JOIN topics t ON t.id = uts.topic_id
+           WHERE uts.user_id = ?`
+        )
+          .bind(auth.user.id)
+          .all<{ slug: string; weight: number; updated_at: string }>();
+
+        const userTopicSignals = new Map<string, { weight: number; updatedAt: string }>();
+        for (const s of signalRows.results || []) {
+          userTopicSignals.set(s.slug, { weight: s.weight, updatedAt: s.updated_at });
+        }
+
+        // 2. Followed user IDs
+        const followRows = await env.DB.prepare(
+          'SELECT followed_id FROM follows WHERE follower_id = ?'
+        )
+          .bind(auth.user.id)
+          .all<{ followed_id: string }>();
+        const followedUserIds = new Set((followRows.results || []).map((f) => f.followed_id));
+
+        // 3. Not interested post IDs
+        const notIntRows = await env.DB.prepare(
+          "SELECT post_id FROM feedback WHERE user_id = ? AND type = 'not_interested'"
+        )
+          .bind(auth.user.id)
+          .all<{ post_id: string }>();
+        const notInterestedPostIds = new Set((notIntRows.results || []).map((f) => f.post_id));
+
+        const rankingContext: UserRankingContext = {
+          userId: auth.user.id,
+          userClassId: auth.profile.class_id || null,
+          followedUserIds,
+          notInterestedPostIds,
+          userTopicSignals,
+          nowMs: Date.now(),
+        };
+
+        // 4. Candidate posts from active pool
+        const candidateRows = await env.DB.prepare(
+          `SELECT p.id, p.author_id, p.body, p.created_at, p.expires_at, p.status,
+                  pr.username AS author_username, pr.display_name AS author_display_name,
+                  pr.avatar_media_id AS author_avatar_media_id, pr.class_id AS author_class_id,
+                  c.name AS author_class_name,
+                  (SELECT COUNT(DISTINCT user_id) FROM post_reactions WHERE post_id = p.id) +
+                  (SELECT COUNT(DISTINCT author_id) FROM comments WHERE post_id = p.id) AS distinct_engagers,
+                  (SELECT COUNT(*) FROM impressions WHERE post_id = p.id) AS impressions_count
+           FROM posts p
+           JOIN profiles pr ON pr.user_id = p.author_id
+           LEFT JOIN classes c ON c.id = pr.class_id
+           WHERE p.status = 'active'
+             AND p.expires_at > ?
+           ORDER BY p.created_at DESC
+           LIMIT 100`
+        )
+          .bind(nowIso)
+          .all<
+            PostRow & {
+              author_username: string;
+              author_display_name: string;
+              author_avatar_media_id: string | null;
+              author_class_id: string | null;
+              author_class_name: string | null;
+              distinct_engagers: number;
+              impressions_count: number;
+            }
+          >();
+
+        const postTopicsMap = new Map<string, Array<{ slug: string; confidence: number }>>();
+        if (candidateRows.results && candidateRows.results.length > 0) {
+          const cIds = candidateRows.results.map((r) => r.id);
+          const ph = cIds.map(() => '?').join(',');
+          const tRows = await env.DB.prepare(
+            `SELECT pt.post_id, t.slug, pt.confidence
+             FROM post_topics pt
+             JOIN topics t ON t.id = pt.topic_id
+             WHERE pt.post_id IN (${ph})`
+          )
+            .bind(...cIds)
+            .all<{ post_id: string; slug: string; confidence: number }>();
+
+          for (const tr of tRows.results || []) {
+            const list = postTopicsMap.get(tr.post_id) || [];
+            list.push({ slug: tr.slug, confidence: tr.confidence });
+            postTopicsMap.set(tr.post_id, list);
+          }
+        }
+
+        const candidates: CandidatePost[] = (candidateRows.results || []).map((r) => ({
+          id: r.id,
+          author_id: r.author_id,
+          author_class_id: r.author_class_id,
+          body: r.body,
+          created_at: r.created_at,
+          expires_at: r.expires_at,
+          status: r.status,
+          topics: postTopicsMap.get(r.id) || [],
+          distinct_engagers: Number(r.distinct_engagers || 0),
+          impressions_count: Number(r.impressions_count || 0),
+        }));
+
+        const ranked = rankPosts(candidates, rankingContext, limit);
+        const rankedIds = ranked.map((rp) => rp.post.id);
+        const matchedRows = (candidateRows.results || []).filter((r) => rankedIds.includes(r.id));
+        const hydrated = await hydratePosts(env.DB, matchedRows, auth.user.id);
+
+        // Sort hydrated according to ranked order
+        hydrated.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
+
+        return jsonResponse({
+          posts: hydrated,
+          next_cursor: null,
+          has_more: false,
+        });
+      }
+
+      // Default: Chronological feed from followed users + own posts
       let query = `
         SELECT p.id, p.author_id, p.body, p.created_at, p.expires_at, p.status,
-               pr.username AS author_username, pr.display_name AS author_display_name, pr.avatar_media_id AS author_avatar_media_id
+               pr.username AS author_username, pr.display_name AS author_display_name,
+               pr.avatar_media_id AS author_avatar_media_id, c.name AS author_class_name
         FROM posts p
         JOIN profiles pr ON pr.user_id = p.author_id
+        LEFT JOIN classes c ON c.id = pr.class_id
         WHERE p.status = 'active'
-          AND p.expires_at > datetime('now')
+          AND p.expires_at > ?
           AND (p.author_id = ? OR p.author_id IN (SELECT followed_id FROM follows WHERE follower_id = ?))
       `;
 
-      const params: unknown[] = [auth.user.id, auth.user.id];
+      const params: unknown[] = [nowIso, auth.user.id, auth.user.id];
 
-      if (cursor) {
-        query += ' AND p.created_at < ?';
-        params.push(cursor);
+      // FIX #7: Cursor pagination on (created_at, id) pairs
+      if (cursorObj) {
+        if (cursorObj.id) {
+          query += ' AND (p.created_at < ? OR (p.created_at = ? AND p.id < ?))';
+          params.push(cursorObj.createdAt, cursorObj.createdAt, cursorObj.id);
+        } else {
+          query += ' AND p.created_at < ?';
+          params.push(cursorObj.createdAt);
+        }
       }
 
-      query += ' ORDER BY p.created_at DESC LIMIT ?';
+      query += ' ORDER BY p.created_at DESC, p.id DESC LIMIT ?';
       params.push(limit + 1);
 
       const rowsResult = await env.DB.prepare(query)
         .bind(...params)
-        .all<PostRow & { author_username: string; author_display_name: string; author_avatar_media_id: string | null }>();
+        .all<
+          PostRow & {
+            author_username: string;
+            author_display_name: string;
+            author_avatar_media_id: string | null;
+            author_class_name: string | null;
+          }
+        >();
 
       const rows = rowsResult.results || [];
       const hasMore = rows.length > limit;
       const itemsToReturn = hasMore ? rows.slice(0, limit) : rows;
 
-      // Populate media, likes, and comments for returned items
-      const posts: PostItem[] = [];
-      for (const p of itemsToReturn) {
-        const media = await env.DB.prepare(
-          `SELECT m.id, m.object_key, m.mime_type, m.size_bytes
-           FROM media m
-           JOIN post_media pm ON pm.media_id = m.id
-           WHERE pm.post_id = ?`
-        )
-          .bind(p.id)
-          .all<MediaItem>();
-
-        const likesCount = await env.DB.prepare(
-          'SELECT COUNT(*) as count FROM post_reactions WHERE post_id = ?'
-        )
-          .bind(p.id)
-          .first<{ count: number }>();
-
-        const hasLiked = await env.DB.prepare(
-          'SELECT 1 FROM post_reactions WHERE post_id = ? AND user_id = ?'
-        )
-          .bind(p.id, auth.user.id)
-          .first();
-
-        const commentsCount = await env.DB.prepare(
-          'SELECT COUNT(*) as count FROM comments WHERE post_id = ?'
-        )
-          .bind(p.id)
-          .first<{ count: number }>();
-
-        posts.push({
-          id: p.id,
-          author_id: p.author_id,
-          author_username: p.author_username,
-          author_display_name: p.author_display_name,
-          author_avatar_media_id: p.author_avatar_media_id,
-          body: p.body,
-          created_at: p.created_at,
-          expires_at: p.expires_at,
-          status: p.status,
-          media: media.results || [],
-          likes_count: Number(likesCount?.count || 0),
-          has_liked: !!hasLiked,
-          comments_count: Number(commentsCount?.count || 0),
-        });
-      }
+      // FIX #6: Hydrate in batched queries (zero N+1)
+      const posts = await hydratePosts(env.DB, itemsToReturn, auth.user.id);
 
       const nextCursor =
-        hasMore && posts.length > 0 ? posts[posts.length - 1]!.created_at : null;
+        hasMore && posts.length > 0
+          ? encodeCursor(posts[posts.length - 1]!.created_at, posts[posts.length - 1]!.id)
+          : null;
 
       return jsonResponse({
         posts,
@@ -925,8 +1452,11 @@ export default {
         )
           .bind(postId, auth.user.id, 'like', now)
           .run();
+
+        // Interest profile: like gives +1 signal to post's topics
+        await updateUserTopicSignalsForPost(env.DB, auth.user.id, postId, 1.0);
       } catch {
-        // Ignored if reaction already exists
+        // Ignored
       }
 
       const likesCount = await env.DB.prepare(
@@ -1022,8 +1552,8 @@ export default {
         return jsonResponse({ error: 'Unauthorized' }, 401);
       }
 
-      // Rate limit: max 30 comments per hour per user
-      const rate = checkRateLimit(`comment:${auth.user.id}`, 30, 60 * 60 * 1000);
+      // FIX #3: D1-backed rate limit: max 30 comments per hour per user
+      const rate = await checkRateLimit(env.DB, `comment:${auth.user.id}`, 30, 60 * 60 * 1000);
       if (!rate.allowed) {
         return jsonResponse(
           { error: 'Rate limit exceeded: maximum 30 comments per hour. Please try again later.' },
@@ -1065,6 +1595,9 @@ export default {
         .bind(commentId, postId, auth.user.id, parseResult.data.body, now, post.expires_at)
         .run();
 
+      // Interest profile: comment gives +3 signal to post's topics
+      await updateUserTopicSignalsForPost(env.DB, auth.user.id, postId, 3.0);
+
       return jsonResponse(
         {
           id: commentId,
@@ -1105,7 +1638,7 @@ export default {
     }
 
     // ==========================================
-    // 4. SOCIAL FOLLOWS & REPORTS
+    // 5. SOCIAL FOLLOWS & REPORTS
     // ==========================================
 
     // POST /api/users/:id/follow - Follow user
@@ -1115,9 +1648,18 @@ export default {
         return jsonResponse({ error: 'Unauthorized' }, 401);
       }
 
+      // FIX #3: D1-backed rate limit: max 60 follows per hour
+      const rate = await checkRateLimit(env.DB, `follow:${auth.user.id}`, 60, 60 * 60 * 1000);
+      if (!rate.allowed) {
+        return jsonResponse(
+          { error: 'Follow rate limit exceeded. Please wait a moment.' },
+          429,
+          { 'Retry-After': String(rate.retryAfterSeconds) }
+        );
+      }
+
       const param = pathname.split('/')[3]!;
 
-      // Find target user by id or username
       const target = await env.DB.prepare(
         'SELECT id FROM users WHERE id = ? OR id IN (SELECT user_id FROM profiles WHERE username_normalized = ?)'
       )
@@ -1128,7 +1670,6 @@ export default {
         return jsonResponse({ error: 'User not found' }, 404);
       }
 
-      // Reject self-follow
       if (target.id === auth.user.id) {
         return jsonResponse({ error: 'Cannot follow yourself' }, 400);
       }
@@ -1169,11 +1710,21 @@ export default {
       return jsonResponse({ success: true, is_following: false });
     }
 
-    // POST /api/reports - File a moderation report
+    // POST /api/reports - File a moderation report (FIX #8)
     if (pathname === '/api/reports' && method === 'POST') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
         return jsonResponse({ error: 'Unauthorized' }, 401);
+      }
+
+      // FIX #3: D1 rate limiter: max 10 reports per hour per user
+      const rate = await checkRateLimit(env.DB, `report:${auth.user.id}`, 10, 60 * 60 * 1000);
+      if (!rate.allowed) {
+        return jsonResponse(
+          { error: 'Report rate limit exceeded. Please try again later.' },
+          429,
+          { 'Retry-After': String(rate.retryAfterSeconds) }
+        );
       }
 
       let body: unknown;
@@ -1192,6 +1743,33 @@ export default {
       }
 
       const { target_type, target_id, reason } = parseResult.data;
+
+      // FIX #8: Verify target exists
+      if (target_type === 'post') {
+        const p = await env.DB.prepare('SELECT id FROM posts WHERE id = ?').bind(target_id).first();
+        if (!p) return jsonResponse({ error: 'Post target not found' }, 404);
+      } else if (target_type === 'comment') {
+        const c = await env.DB.prepare('SELECT id FROM comments WHERE id = ?').bind(target_id).first();
+        if (!c) return jsonResponse({ error: 'Comment target not found' }, 404);
+      } else if (target_type === 'user') {
+        const u = await env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(target_id).first();
+        if (!u) return jsonResponse({ error: 'User target not found' }, 404);
+      }
+
+      // FIX #8: One open report per reporter and target
+      const existingReport = await env.DB.prepare(
+        "SELECT id FROM reports WHERE reporter_id = ? AND target_type = ? AND target_id = ? AND status = 'pending'"
+      )
+        .bind(auth.user.id, target_type, target_id)
+        .first();
+
+      if (existingReport) {
+        return jsonResponse(
+          { error: 'You already have an open report pending review for this item' },
+          409
+        );
+      }
+
       const reportId = `rep_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
       const now = new Date().toISOString();
 
@@ -1208,24 +1786,109 @@ export default {
     }
 
     // ==========================================
-    // 5. MEDIA STORAGE (R2) & AUTHORIZED SERVING
+    // 6. ADMIN MODERATION ROUTES (FIX #8)
     // ==========================================
 
-    // POST /api/media/uploads - Upload media (max 5 MB, jpeg/png/webp only)
+    // GET /api/admin/reports - Retrieve all moderation reports (requires admin secret)
+    if (pathname === '/api/admin/reports' && method === 'GET') {
+      const adminSecretHeader = request.headers.get('x-admin-secret') || '';
+      const isAuthorized =
+        (env.ADMIN_SECRET && constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) ||
+        ((isDevelopment || isTest) && !env.ADMIN_SECRET);
+
+      if (!isAuthorized) {
+        return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+      }
+
+      const statusParam = url.searchParams.get('status') || '';
+      let query = `
+        SELECT r.id, r.reporter_id, r.target_type, r.target_id, r.reason, r.status, r.created_at,
+               pr.username AS reporter_username
+        FROM reports r
+        JOIN profiles pr ON pr.user_id = r.reporter_id
+      `;
+      const params: unknown[] = [];
+
+      if (statusParam) {
+        query += ' WHERE r.status = ?';
+        params.push(statusParam);
+      }
+
+      query += ' ORDER BY r.created_at DESC LIMIT 100';
+
+      const reports = await env.DB.prepare(query).bind(...params).all();
+      return jsonResponse({ reports: reports.results || [] });
+    }
+
+    // PATCH /api/admin/reports/:id - Set report status (reviewed or dismissed)
+    if (pathname.startsWith('/api/admin/reports/') && method === 'PATCH') {
+      const adminSecretHeader = request.headers.get('x-admin-secret') || '';
+      const isAuthorized =
+        (env.ADMIN_SECRET && constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) ||
+        ((isDevelopment || isTest) && !env.ADMIN_SECRET);
+
+      if (!isAuthorized) {
+        return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
+      }
+
+      const reportId = pathname.slice('/api/admin/reports/'.length);
+
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const parseResult = updateReportSchema.safeParse(body);
+      if (!parseResult.success) {
+        return jsonResponse({ error: 'Validation failed', issues: parseResult.error.issues }, 400);
+      }
+
+      const { status: newStatus } = parseResult.data;
+
+      const report = await env.DB.prepare('SELECT id FROM reports WHERE id = ?').bind(reportId).first();
+      if (!report) {
+        return jsonResponse({ error: 'Report not found' }, 404);
+      }
+
+      await env.DB.prepare('UPDATE reports SET status = ? WHERE id = ?').bind(newStatus, reportId).run();
+
+      return jsonResponse({ success: true, id: reportId, status: newStatus });
+    }
+
+    // ==========================================
+    // 7. MEDIA STORAGE (R2) & AUTHORIZED SERVING
+    // ==========================================
+
+    // POST /api/media/uploads - Upload media (max 5 MB, jpeg/png/webp only) (FIX #4)
     if (pathname === '/api/media/uploads' && method === 'POST') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
         return jsonResponse({ error: 'Unauthorized' }, 401);
       }
 
-      // Rate limit: max 20 uploads per hour per user
-      const rate = checkRateLimit(`upload:${auth.user.id}`, 20, 60 * 60 * 1000);
+      // FIX #3: D1 rate limiter: max 20 uploads per hour per user
+      const rate = await checkRateLimit(env.DB, `upload:${auth.user.id}`, 20, 60 * 60 * 1000);
       if (!rate.allowed) {
         return jsonResponse(
           { error: 'Rate limit exceeded: maximum 20 uploads per hour. Please try again later.' },
           429,
           { 'Retry-After': String(rate.retryAfterSeconds) }
         );
+      }
+
+      // FIX #4: Reject by Content-Length before reading the body
+      const clHeader = request.headers.get('content-length');
+      const maxSizeBytes = 5 * 1024 * 1024;
+      if (clHeader) {
+        const declaredSize = Number(clHeader);
+        if (declaredSize > maxSizeBytes) {
+          return jsonResponse(
+            { error: `File exceeds maximum size of 5 MB (actual: ${(declaredSize / (1024 * 1024)).toFixed(2)} MB)` },
+            400
+          );
+        }
       }
 
       const contentType = request.headers.get('Content-Type') || '';
@@ -1249,13 +1912,12 @@ export default {
         const ab = await (file as File).arrayBuffer();
         fileBytes = new Uint8Array(ab);
       } else {
-        // Direct binary upload with Content-Type header
         mimeType = contentType.split(';')[0]!.trim();
         const ab = await request.arrayBuffer();
         fileBytes = new Uint8Array(ab);
       }
 
-      // Validate MIME type (jpeg/png/webp)
+      // Validate MIME type
       const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
       if (!allowedTypes.includes(mimeType)) {
         return jsonResponse(
@@ -1264,8 +1926,7 @@ export default {
         );
       }
 
-      // Validate file size (max 5 MB)
-      const maxSizeBytes = 5 * 1024 * 1024;
+      // Validate file size
       if (fileBytes.length === 0) {
         return jsonResponse({ error: 'File is empty' }, 400);
       }
@@ -1276,11 +1937,39 @@ export default {
         );
       }
 
-      // Generate random object key
+      // FIX #4: Verify magic bytes match declared type
+      const isJpeg =
+        fileBytes.length >= 3 && fileBytes[0] === 0xff && fileBytes[1] === 0xd8 && fileBytes[2] === 0xff;
+      const isPng =
+        fileBytes.length >= 4 &&
+        fileBytes[0] === 0x89 &&
+        fileBytes[1] === 0x50 &&
+        fileBytes[2] === 0x4e &&
+        fileBytes[3] === 0x47;
+      const isWebp =
+        fileBytes.length >= 12 &&
+        fileBytes[0] === 0x52 &&
+        fileBytes[1] === 0x49 &&
+        fileBytes[2] === 0x46 &&
+        fileBytes[3] === 0x46 &&
+        fileBytes[8] === 0x57 &&
+        fileBytes[9] === 0x45 &&
+        fileBytes[10] === 0x42 &&
+        fileBytes[11] === 0x50;
+
+      if (mimeType === 'image/jpeg' && !isJpeg) {
+        return jsonResponse({ error: 'File magic bytes do not match declared image/jpeg' }, 400);
+      }
+      if (mimeType === 'image/png' && !isPng) {
+        return jsonResponse({ error: 'File magic bytes do not match declared image/png' }, 400);
+      }
+      if (mimeType === 'image/webp' && !isWebp) {
+        return jsonResponse({ error: 'File magic bytes do not match declared image/webp' }, 400);
+      }
+
       const mediaId = `med_${generateRandomString(16).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
       const objectKey = `media_${generateRandomString(24).toLowerCase().replace(/[^a-z0-9]/g, '')}`;
 
-      // Store in R2
       if (env.MEDIA_BUCKET) {
         await env.MEDIA_BUCKET.put(objectKey, fileBytes, {
           httpMetadata: { contentType: mimeType },
@@ -1309,7 +1998,7 @@ export default {
       );
     }
 
-    // GET /api/media/:id - Authorized Worker route serving R2 stream
+    // GET /api/media/:id - Authorized Worker route serving R2 stream with nosniff (FIX #4)
     if (pathname.startsWith('/api/media/') && method === 'GET') {
       const auth = await authenticateRequest(request, env.DB);
       if (!auth) {
@@ -1336,9 +2025,11 @@ export default {
         return jsonResponse({ error: 'Media file missing from storage' }, 404);
       }
 
+      // FIX #4: add nosniff header on media responses
       return new Response(r2Object.body as any, {
         headers: {
           'Content-Type': media.mime_type,
+          'X-Content-Type-Options': 'nosniff',
           'Cache-Control': 'private, max-age=86400',
         },
       });
@@ -1370,7 +2061,7 @@ export default {
         try {
           await env.MEDIA_BUCKET.delete(media.object_key);
         } catch {
-          // Ignore R2 deletion error
+          // Ignore R2 error
         }
       }
 
@@ -1380,26 +2071,37 @@ export default {
     }
 
     // ==========================================
-    // 6. JOBS & LIFECYCLE
+    // 8. JOBS & LIFECYCLE (FIX #1, FIX #2)
     // ==========================================
 
     // POST /api/jobs/cleanup-expired - Trigger post lifecycle expiry job
     if (pathname === '/api/jobs/cleanup-expired' && method === 'POST') {
-      const auth = await authenticateRequest(request, env.DB);
-      if (!auth) {
-        return jsonResponse({ error: 'Unauthorized' }, 401);
+      const adminSecretHeader = request.headers.get('x-admin-secret') || '';
+      const isAuthorizedAdmin =
+        (env.ADMIN_SECRET && constantTimeCompare(adminSecretHeader, env.ADMIN_SECRET)) ||
+        ((isDevelopment || isTest) && !env.ADMIN_SECRET);
+
+      // In development or with admin secret, or in test mode
+      const isDevOrTest = isDevelopment || isTest;
+      if (!isDevOrTest && !isAuthorizedAdmin) {
+        return jsonResponse({ error: 'Unauthorized: Admin secret required' }, 401);
       }
 
-      // Optional reference_time query param for testing time travel
-      const refTimeParam = url.searchParams.get('reference_time');
-      const refTime = refTimeParam ? Number(refTimeParam) : Date.now();
+      // FIX #1: Remove the reference_time parameter outside tests; the daily cron uses the real clock
+      let refTime = Date.now();
+      if (isDevOrTest) {
+        const refTimeParam = url.searchParams.get('reference_time');
+        if (refTimeParam) {
+          refTime = Number(refTimeParam);
+        }
+      }
 
       const result = await runPostLifecycleExpiry(env, refTime);
       return jsonResponse(result);
     }
 
     // ==========================================
-    // 7. 404 CATCH-ALL
+    // 9. 404 CATCH-ALL
     // ==========================================
 
     if (pathname.startsWith('/api/')) {

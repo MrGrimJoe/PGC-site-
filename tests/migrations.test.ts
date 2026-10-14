@@ -12,12 +12,14 @@ describe('Migrations runner', () => {
 
     expect(result.applied).toContain('001_init.sql');
     expect(result.applied).toContain('002_social.sql');
+    expect(result.applied).toContain('003_discovery.sql');
 
-    // Verify _migrations tracking table contains both migrations
+    // Verify _migrations tracking table contains migrations
     const migrationsRows = await db.prepare('SELECT name FROM _migrations').all<{ name: string }>();
     const migrationNames = migrationsRows.results.map((r) => r.name);
     expect(migrationNames).toContain('001_init.sql');
     expect(migrationNames).toContain('002_social.sql');
+    expect(migrationNames).toContain('003_discovery.sql');
 
     // Verify all required tables exist
     const tablesQuery = await db
@@ -38,6 +40,14 @@ describe('Migrations runner', () => {
     expect(tableNames).toContain('comments');
     expect(tableNames).toContain('follows');
     expect(tableNames).toContain('reports');
+    expect(tableNames).toContain('classes');
+    expect(tableNames).toContain('topics');
+    expect(tableNames).toContain('post_topics');
+    expect(tableNames).toContain('user_topic_signals');
+    expect(tableNames).toContain('impressions');
+    expect(tableNames).toContain('feedback');
+    expect(tableNames).toContain('trend_snapshots');
+    expect(tableNames).toContain('rate_limits');
     expect(tableNames).toContain('_migrations');
 
     // Verify indexes exist
@@ -52,6 +62,9 @@ describe('Migrations runner', () => {
     expect(indexNames).toContain('idx_profiles_username_normalized');
     expect(indexNames).toContain('idx_posts_feed');
     expect(indexNames).toContain('idx_posts_expires_at');
+    expect(indexNames).toContain('idx_post_topics_topic');
+    expect(indexNames).toContain('idx_user_topic_signals_user');
+    expect(indexNames).toContain('idx_rate_limits_key');
   });
 
   it('is idempotent when run multiple times', async () => {
@@ -59,7 +72,7 @@ describe('Migrations runner', () => {
 
     // First run
     const firstRun = await runMigrations(db);
-    expect(firstRun.applied.length).toBe(2);
+    expect(firstRun.applied.length).toBe(3);
 
     // Second run: should not re-run applied migrations
     const secondRun = await runMigrations(db);

@@ -34,6 +34,7 @@ export const updateProfileSchema = z
       .max(500, { message: 'Bio cannot exceed 500 characters' })
       .optional(),
     avatar_media_id: z.string().nullable().optional(),
+    class_id: z.string().nullable().optional(),
     dm_policy: z.enum(['everyone', 'following', 'none']).optional(),
     feed_preferences: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
   })
@@ -94,14 +95,38 @@ export const createReportSchema = z
 export type CreateReportInput = z.infer<typeof createReportSchema>;
 
 /**
+ * Post feedback schema ('more_like_this', 'show_less', 'not_interested')
+ */
+export const createFeedbackSchema = z
+  .object({
+    post_id: z.string().min(1, { message: 'Post ID required' }),
+    type: z.enum(['more_like_this', 'show_less', 'not_interested']),
+  })
+  .strict();
+
+export type CreateFeedbackInput = z.infer<typeof createFeedbackSchema>;
+
+/**
+ * Admin report update schema
+ */
+export const updateReportSchema = z
+  .object({
+    status: z.enum(['reviewed', 'dismissed', 'pending']),
+  })
+  .strict();
+
+export type UpdateReportInput = z.infer<typeof updateReportSchema>;
+
+/**
  * Public Profile Response (GET /api/users/:username)
  */
 export interface PublicProfileResponse {
-  id?: string;
   username: string;
   display_name: string;
   bio: string;
   avatar_media_id: string | null;
+  class_id?: string | null;
+  class_name?: string | null;
   created_at: string;
   is_following?: boolean;
   followers_count?: number;
@@ -123,6 +148,8 @@ export interface MeResponse {
     display_name: string;
     bio: string;
     avatar_media_id: string | null;
+    class_id?: string | null;
+    class_name?: string | null;
   };
   settings: {
     dm_policy: string;
@@ -141,6 +168,16 @@ export interface MediaItem {
 }
 
 /**
+ * Topic item interface
+ */
+export interface TopicItem {
+  id?: string;
+  slug: string;
+  display_name: string;
+  confidence?: number;
+}
+
+/**
  * Post item interface
  */
 export interface PostItem {
@@ -149,14 +186,25 @@ export interface PostItem {
   author_username: string;
   author_display_name: string;
   author_avatar_media_id: string | null;
+  author_class_name?: string | null;
   body: string;
   created_at: string;
   expires_at: string;
   status: string;
   media: MediaItem[];
+  topics?: TopicItem[];
   likes_count: number;
   has_liked: boolean;
   comments_count: number;
+  _debug?: {
+    interestScore: number;
+    socialScore: number;
+    recencyScore: number;
+    engagementScore: number;
+    classScore: number;
+    totalScore: number;
+    pool?: string;
+  };
 }
 
 /**
@@ -189,3 +237,37 @@ export interface CommentsResponse {
   next_cursor: string | null;
   has_more: boolean;
 }
+
+/**
+ * User Interest Signal
+ */
+export interface UserInterestTopic {
+  topic_id: string;
+  slug: string;
+  display_name: string;
+  raw_weight: number;
+  effective_weight: number;
+  updated_at: string;
+}
+
+/**
+ * Campus Class Item
+ */
+export interface ClassItem {
+  id: string;
+  name: string;
+}
+export type ClassRow = ClassItem;
+
+/**
+ * Trend Snapshot Item
+ */
+export interface TrendItem {
+  topic_id: string;
+  slug: string;
+  display_name: string;
+  window: '24h' | '7d';
+  score: number;
+}
+
+
